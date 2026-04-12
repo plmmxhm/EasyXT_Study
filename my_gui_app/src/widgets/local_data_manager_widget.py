@@ -4336,6 +4336,40 @@ class LocalDataManagerWidget(QWidget):
         self.save_parquet_checkbox.stateChanged.connect(self.on_save_parquet_changed)
         init_layout.addWidget(self.save_parquet_checkbox)
         
+        # 【新增】数据存储模式选择（2026-04-12）
+        storage_mode_layout = QHBoxLayout()
+        storage_mode_layout.setContentsMargins(10, 0, 0, 0)
+        
+        storage_mode_label = QLabel("📂 存储模式:")
+        storage_mode_label.setToolTip("选择数据的存储方式")
+        storage_mode_layout.addWidget(storage_mode_label)
+        
+        self.storage_mode_parquet_radio = QRadioButton("Parquet模式")
+        self.storage_mode_database_radio = QRadioButton("数据库表模式")
+        
+        # 默认选择Parquet模式
+        self.storage_mode_parquet_radio.setChecked(True)
+        
+        self.storage_mode_parquet_radio.setToolTip(
+            "数据保存到Parquet文件，通过DuckDB视图查询\n"
+            "✅ 优点：文件可移植、支持长期归档\n"
+            "⚠️ 缺点：需要维护视图，查询速度稍慢"
+        )
+        self.storage_mode_database_radio.setToolTip(
+            "数据直接保存到DuckDB物理表，查询时直接读取\n"
+            "✅ 优点：查询速度快、无需视图维护\n"
+            "⚠️ 缺点：数据在数据库内，不易移植"
+        )
+        
+        storage_mode_layout.addWidget(self.storage_mode_parquet_radio)
+        storage_mode_layout.addWidget(self.storage_mode_database_radio)
+        
+        # 连接信号槽
+        self.storage_mode_parquet_radio.toggled.connect(self.on_storage_mode_changed)
+        self.storage_mode_database_radio.toggled.connect(self.on_storage_mode_changed)
+        
+        init_layout.addLayout(storage_mode_layout)
+        
         # 测试模式单选框（直接显示，无矩形框，无左侧间距）
         test_mode_layout = QHBoxLayout()
         test_mode_layout.setContentsMargins(10, 0, 0, 0)  # 移除左侧间距
@@ -6255,6 +6289,28 @@ class LocalDataManagerWidget(QWidget):
             self.log("💾 已选择：保存Parquet文件（使用direct策略）")
         else:
             self.log("💾 已选择：不保存Parquet文件（使用temp策略）")
+    
+    def on_storage_mode_changed(self):
+        """【新增】数据存储模式变化时的处理"""
+        if hasattr(self, 'storage_mode_parquet_radio') and hasattr(self, 'storage_mode_database_radio'):
+            if self.storage_mode_parquet_radio.isChecked():
+                mode = 'parquet'
+                self.log("📂 存储模式：Parquet模式（数据将保存到Parquet文件）")
+            elif self.storage_mode_database_radio.isChecked():
+                mode = 'database'
+                self.log("📂 存储模式：数据库表模式（数据将直接保存到DuckDB表）")
+            else:
+                mode = 'parquet'  # 默认
+            
+            # 更新配置
+            if hasattr(self, 'config') and self.config:
+                if 'storage' not in self.config:
+                    self.config['storage'] = {}
+                if 'data_source' not in self.config['storage']:
+                    self.config['storage']['data_source'] = {}
+                
+                self.config['storage']['data_source']['mode'] = mode
+                self.log(f"✅ 配置已更新: storage.data_source.mode = {mode}")
 
     def download_single_financial(self):
         """下载单只股票的财务数据"""

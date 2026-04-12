@@ -10,13 +10,27 @@ data_paths:
 
 # 存储配置
 storage:
-  format: "parquet"         # 存储格式：parquet（推荐）
+  format: "parquet"         # 存储格式：parquet（推荐）或 database
   compression: "snappy"     # 压缩算法：snappy/gzip/brotli
   partition_by: "year"      # 按年份分区：year/month/None
   temp_file_strategy: "direct"  # 临时文件生成策略：direct（直接使用配置路径）或 temp（生成临时文件）
   temp_dir: "TEMP"         # 临时文件存储目录
                             # - 相对路径：相对于data_paths.root_dir，如 "temp"
                             # - 绝对路径：完整路径，如 "Z:/TEMP" 或 "D:/StockData/temp"
+  
+  # 【新增】数据源模式配置（2026-04-12）
+  data_source:
+    mode: "parquet"         # 存储模式：parquet（默认，保存到Parquet文件）或 database（直接保存到数据库表）
+                            # parquet: 数据保存到Parquet文件，通过DuckDB视图查询
+                            # database: 数据直接保存到DuckDB物理表，查询时直接读取表
+    
+  # 【新增】查询优先级配置
+  query_priority:
+    preferred: "auto"       # 查询优先级：
+                             # auto: 自动检测哪种数据可用（推荐）
+                             # parquet: 强制从Parquet视图查询
+                             # table: 强制从数据库表查询
+    fallback: true          # 是否允许回退到另一数据源（当首选数据源无数据时）
   
   # Parquet存储配置
   parquet:
