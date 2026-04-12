@@ -225,7 +225,13 @@ class DataDownloadThread(QThread):
             config = DownloadConfig()
             data_config = config.get_config()
             
-            dbfile = data_config.get('database', {}).get('dbfile', 'stock_data.ddb')
+            # 【修复】优先使用新版双库架构配置（2026-04-12）
+            db_config = data_config.get('database', {})
+            if 'data_db' in db_config and 'dbfile' in db_config['data_db']:
+                dbfile = db_config['data_db']['dbfile']
+            else:
+                dbfile = db_config.get('dbfile', 'stock_data.duckdb')
+            
             data_root_dir = data_config.get('data_paths', {}).get('root_dir', 'D:/MyStockData')
             db_path = str(Path(data_root_dir) / dbfile)
             
@@ -4955,7 +4961,7 @@ class LocalDataManagerWidget(QWidget):
             import traceback
             self.log(f"⚠️ 详细错误: {traceback.format_exc()}")
             # 使用默认路径
-            self.db_path = 'D:/MyStockData/stock_data.ddb'
+            self.db_path = 'D:/MyStockData/stock_data.duckdb'
             self.log(f"⚠️ 使用默认数据库路径: {self.db_path}")
             
             # 确保数据库目录存在
@@ -5068,7 +5074,30 @@ class LocalDataManagerWidget(QWidget):
     
     def _resolve_database_path(self):
         """解析数据库路径"""
-        # 1. 从合并后的配置中获取数据库路径
+        
+        # 【新增】5. 优先使用新的双数据库文件配置（2026-04-12）
+        if 'database' in self.config:
+            db_config = self.config['database']
+            
+            # 优先检查 data_db（物理表数据库）配置
+            if 'data_db' in db_config and 'dbfile' in db_config['data_db']:
+                root_dir = self.config.get('data_paths', {}).get('root_dir', 'D:/MyStockData')
+                data_db_file = db_config['data_db']['dbfile']
+                db_path = str(Path(root_dir) / data_db_file)
+                self.log(f"✅ 使用新的物理表数据库配置: {db_path}")
+                self.log(f"   配置描述: {db_config['data_db'].get('description', 'N/A')}")
+                return db_path
+            
+            # 兼容：如果只有 view_db，也返回它（作为默认库）
+            elif 'view_db' in db_config and 'dbfile' in db_config['view_db']:
+                root_dir = self.config.get('data_paths', {}).get('root_dir', 'D:/MyStockData')
+                view_db_file = db_config['view_db']['dbfile']
+                db_path = str(Path(root_dir) / view_db_file)
+                self.log(f"✅ 使用视图数据库配置: {db_path}")
+                self.log(f"   ⚠️  注意: 未找到 data_db 配置，使用 view_db 作为默认")
+                return db_path
+        
+        # 1. 从合并后的配置中获取数据库路径（兼容旧配置）
         if 'database' in self.config and 'path' in self.config['database']:
             db_path = self.config['database']['path']
             self.log(f"✅ 从配置文件读取数据库路径: {db_path}")
@@ -5091,9 +5120,9 @@ class LocalDataManagerWidget(QWidget):
             self.log(f"✅ 从旧格式配置文件读取数据库路径: {db_path}")
             return db_path
         
-        # 4. 如果没有配置，使用默认路径
+        # 4. 如果没有配置，使用默认路径（2026-04-12 修正：与配置文件一致使用.duckdb）
         else:
-            db_path = 'D:/MyStockData/stock_data.ddb'
+            db_path = 'D:/MyStockData/stock_data.duckdb'
             self.log(f"⚠️ 配置文件中未设置数据库路径，使用默认路径: {db_path}")
             return db_path
     
@@ -5154,8 +5183,12 @@ class LocalDataManagerWidget(QWidget):
             from src.core.data.database.db_manager import get_db_manager
             import duckdb
             
-            # 使用配置文件中的路径组合数据库路径
-            db_path = self.config.get('database', {}).get('dbfile', 'stock_data.ddb')
+            # 使用配置文件中的路径组合数据库路径（2026-04-12 修复：支持双库架构）
+            db_config = self.config.get('database', {})
+            if 'data_db' in db_config and 'dbfile' in db_config['data_db']:
+                db_path = db_config['data_db']['dbfile']
+            else:
+                db_path = db_config.get('dbfile', 'stock_data.duckdb')
             if not os.path.isabs(db_path):
                 # 从配置文件获取根目录
                 data_root_dir = self.config.get('data_paths', {}).get('root_dir', 'D:/MyStockData')
@@ -5193,7 +5226,12 @@ class LocalDataManagerWidget(QWidget):
                     config = DownloadConfig(self.config)
                     data_config = config.get_config()
                     
-                    dbfile = data_config.get('database', {}).get('dbfile', 'stock_data.ddb')
+                    # 【修复】优先使用新版双库架构配置（2026-04-12）
+                    db_cfg = data_config.get('database', {})
+                    if 'data_db' in db_cfg and 'dbfile' in db_cfg['data_db']:
+                        dbfile = db_cfg['data_db']['dbfile']
+                    else:
+                        dbfile = db_cfg.get('dbfile', 'stock_data.duckdb')
                     data_root_dir = data_config.get('data_paths', {}).get('root_dir', 'D:/MyStockData')
                     duckdb_path = str(Path(data_root_dir) / dbfile)
                     
@@ -5670,6 +5708,33 @@ class LocalDataManagerWidget(QWidget):
             
             self.log(f"  Tick数据: {tick_symbols} 个标的, {tick_records:,} 条记录")
             self.log(f"  总计: {total_symbols} 个标的, {total_records:,} 条记录")
+            
+            # 【新增】显示存储模式信息（2026-04-12）
+            storage_mode = self.config.get('storage', {}).get('data_source', {}).get('mode', 'parquet')
+            
+            # 【修复】支持新的 dual 双重存储模式（2026-04-12）
+            if storage_mode == 'parquet':
+                mode_text = "Parquet 文件模式"
+            elif storage_mode == 'database':
+                mode_text = "数据库表模式"
+            elif storage_mode == 'dual':
+                mode_text = "双重存储模式（Parquet + DuckDB表）"
+            else:
+                mode_text = f"未知模式 ({storage_mode})"
+            
+            self.log(f"\n📦 存储模式: {mode_text}")
+            self.log(f"💾 数据库路径: {self.db_path}")
+            
+            # 显示双数据库配置
+            if 'database' in self.config:
+                db_config = self.config['database']
+                has_dual_db = 'data_db' in db_config and 'view_db' in db_config
+                if has_dual_db:
+                    self.log(f"🔗 数据库架构: ✅ 双数据库架构")
+                    self.log(f"   ├─ 物理表库: {db_config.get('data_db', {}).get('dbfile', 'N/A')}")
+                    self.log(f"   └─ 视图库: {db_config.get('view_db', {}).get('dbfile', 'N/A')}")
+                else:
+                    self.log(f"🔗 数据库架构: ⚪ 单数据库架构")
 
         except Exception as e:
             self.log(f"[ERROR] 加载统计数据失败: {e}")
@@ -5719,6 +5784,70 @@ class LocalDataManagerWidget(QWidget):
             overview_group_layout.addWidget(QLabel(f"{stats['size_mb']:.2f} MB"), 5, 1)
             overview_group_layout.addWidget(QLabel("最新日期:"), 6, 0)
             overview_group_layout.addWidget(QLabel(f"{stats['latest_date']}"), 6, 1)
+            
+            # 【新增】存储模式信息展示（2026-04-12）
+            overview_group_layout.addWidget(QLabel("─" * 20), 7, 0, 1, 2)
+            overview_group_layout.addWidget(QLabel("📦 存储模式:"), 8, 0)
+            
+            # 获取存储模式配置
+            storage_mode = self.config.get('storage', {}).get('data_source', {}).get('mode', 'parquet')
+            
+            # 【修复】支持新的 dual 双重存储模式（2026-04-12）
+            if storage_mode == 'parquet':
+                mode_text = "Parquet 文件模式"
+                mode_desc = "数据保存为 Parquet 文件，通过 DuckDB 视图查询"
+                mode_color = "#2196F3"
+            elif storage_mode == 'database':
+                mode_text = "数据库表模式"
+                mode_desc = "数据直接保存到 DuckDB 物理表"
+                mode_color = "#4CAF50"
+            elif storage_mode == 'dual':
+                mode_text = "双重存储模式（Parquet + DuckDB表）"
+                mode_desc = "数据同时保存为 Parquet 文件和 DuckDB 物理表，支持灵活查询"
+                mode_color = "#9C27B0"
+            else:
+                mode_text = f"未知模式 ({storage_mode})"
+                mode_desc = "请检查配置文件"
+                mode_color = "#FF9800"
+            
+            mode_label = QLabel(mode_text)
+            mode_label.setStyleSheet(f"color: {mode_color}; font-weight: bold;")
+            overview_group_layout.addWidget(mode_label, 8, 1)
+            
+            overview_group_layout.addWidget(QLabel("📝 模式说明:"), 9, 0)
+            desc_label = QLabel(mode_desc)
+            desc_label.setStyleSheet("color: #666;")
+            overview_group_layout.addWidget(desc_label, 9, 1)
+            
+            overview_group_layout.addWidget(QLabel("💾 数据库路径:"), 10, 0)
+            db_path_label = QLabel(self.db_path)
+            db_path_label.setStyleSheet("color: #333;")
+            db_path_label.setToolTip(f"完整路径: {self.db_path}")
+            overview_group_layout.addWidget(db_path_label, 10, 1)
+            
+            # 显示双数据库配置
+            if 'database' in self.config:
+                db_config = self.config['database']
+                has_dual_db = 'data_db' in db_config and 'view_db' in db_config
+                
+                if has_dual_db:
+                    overview_group_layout.addWidget(QLabel("🔗 数据库架构:"), 11, 0)
+                    dual_label = QLabel("✅ 双数据库架构")
+                    dual_label.setStyleSheet("color: #4CAF50; font-weight: bold;")
+                    overview_group_layout.addWidget(dual_label, 11, 1)
+                    
+                    overview_group_layout.addWidget(QLabel("   ├─ 物理表库:"), 12, 0)
+                    data_db_file = db_config.get('data_db', {}).get('dbfile', 'N/A')
+                    overview_group_layout.addWidget(QLabel(data_db_file), 12, 1)
+                    
+                    overview_group_layout.addWidget(QLabel("   └─ 视图库:"), 13, 0)
+                    view_db_file = db_config.get('view_db', {}).get('dbfile', 'N/A')
+                    overview_group_layout.addWidget(QLabel(view_db_file), 13, 1)
+                else:
+                    overview_group_layout.addWidget(QLabel("🔗 数据库架构:"), 11, 0)
+                    single_label = QLabel("⚪ 单数据库架构")
+                    single_label.setStyleSheet("color: #FF9800;")
+                    overview_group_layout.addWidget(single_label, 11, 1)
 
             overview_layout.addWidget(overview_group)
 
@@ -6694,7 +6823,12 @@ class LocalDataManagerWidget(QWidget):
             config = DownloadConfig(self.config)
             data_config = config.get_config()
             
-            dbfile = data_config.get('database', {}).get('dbfile', 'stock_data.ddb')
+            # 【修复】优先使用新版双库架构配置（2026-04-12）
+            db_cfg = data_config.get('database', {})
+            if 'data_db' in db_cfg and 'dbfile' in db_cfg['data_db']:
+                dbfile = db_cfg['data_db']['dbfile']
+            else:
+                dbfile = db_cfg.get('dbfile', 'stock_data.duckdb')
             data_root_dir = data_config.get('data_paths', {}).get('root_dir', 'D:/MyStockData')
             duckdb_path = str(Path(data_root_dir) / dbfile)
             

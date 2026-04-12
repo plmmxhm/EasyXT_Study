@@ -1,103 +1,88 @@
-# 本地数据管理系统配置
-
-# 数据目录配置
 data_paths:
-  root_dir: "D:/MyStockData"   # 数据存储根目录（已修改为D盘）
-  raw_data: "raw"           # 原始行情数据
-  factors: "factors"        # 因子数据（可选缓存）
-  cache: "cache"            # 临时缓存
-  metadata: "metadata.db"   # SQLite元数据库
-
-# 存储配置
+  root_dir: D:/MyStockData
+  raw_data: raw
+  factors: factors
+  cache: cache
+  metadata: metadata.db
 storage:
-  format: "parquet"         # 存储格式：parquet（推荐）或 database
-  compression: "snappy"     # 压缩算法：snappy/gzip/brotli
-  partition_by: "year"      # 按年份分区：year/month/None
-  temp_file_strategy: "direct"  # 临时文件生成策略：direct（直接使用配置路径）或 temp（生成临时文件）
-  temp_dir: "TEMP"         # 临时文件存储目录
-                            # - 相对路径：相对于data_paths.root_dir，如 "temp"
-                            # - 绝对路径：完整路径，如 "Z:/TEMP" 或 "D:/StockData/temp"
-  
-  # 【新增】数据源模式配置（2026-04-12）
+  format: parquet
+  compression: snappy
+  partition_by: year
+  temp_file_strategy: direct
+  temp_dir: TEMP
   data_source:
-    mode: "parquet"         # 存储模式：parquet（默认，保存到Parquet文件）或 database（直接保存到数据库表）
-                            # parquet: 数据保存到Parquet文件，通过DuckDB视图查询
-                            # database: 数据直接保存到DuckDB物理表，查询时直接读取表
-    
-  # 【新增】查询优先级配置
+    mode: parquet
   query_priority:
-    preferred: "auto"       # 查询优先级：
-                             # auto: 自动检测哪种数据可用（推荐）
-                             # parquet: 强制从Parquet视图查询
-                             # table: 强制从数据库表查询
-    fallback: true          # 是否允许回退到另一数据源（当首选数据源无数据时）
-  
-  # Parquet存储配置
+    preferred: auto
+    fallback: true
   parquet:
-    root_dir: "Parquet"     # Parquet存储根目录
+    root_dir: Parquet
     structure:
-      kline:                # K线数据结构
-        1d: "kline/daily"      # 日线数据路径
-        1w: "kline/weekly"     # 周线数据路径
-        1M: "kline/monthly"    # 月线数据路径
-        1m: "kline/1m"      # 1分钟数据路径
-        5m: "kline/5m"      # 5分钟数据路径
-        15m: "kline/15m"    # 15分钟数据路径
-        30m: "kline/30m"    # 30分钟数据路径
-        60m: "kline/60m"    # 60分钟数据路径
-      tick: "tick"          # Tick数据路径
+      kline:
+        1d: kline/daily
+        1w: kline/weekly
+        1M: kline/monthly
+        1m: kline/1m
+        5m: kline/5m
+        15m: kline/15m
+        30m: kline/30m
+        60m: kline/60m
+      tick: tick
     naming:
-      kline: "{symbol}.parquet"     # K线数据文件名格式
-      tick: "{symbol}.parquet" # Tick数据文件名格式
-
-# 数据更新配置
+      kline: '{symbol}.parquet'
+      tick: '{symbol}.parquet'
 update:
-  auto_check: true          # 启动时自动检查更新
-  update_time: "18:00"      # 每日更新时间
-  max_retries: 3            # 下载失败重试次数
-  batch_size: 20         # 批量下载大小
-
-# 数据源配置
+  auto_check: true
+  update_time: '18:00'
+  max_retries: 3
+  batch_size: 20
 data_sources:
-  primary: "qmt"            # 首选数据源：qmt/akshare
-  fallback: "akshare"       # 备用数据源
-  enable_mock: true         # 启用模拟数据（测试用）
-
-# 市场配置
+  primary: qmt
+  fallback: akshare
+  enable_mock: true
 markets:
   stocks:
     enabled: true
-    patterns: ["*.SH", "*.SZ", "*.BJ"]  # 上交所、深交所、北交所
+    patterns:
+    - '*.SH'
+    - '*.SZ'
+    - '*.BJ'
   convertible_bonds:
     enabled: true
-    patterns: ["*.SH", "*.SZ","*.BJ"]
-
-# 缓存配置
+    patterns:
+    - '*.SH'
+    - '*.SZ'
+    - '*.BJ'
 cache:
-  memory_max_mb: 4096        # 内存缓存最大4096MB，从2048MB增加
-  enable_factor_cache: false # 是否缓存因子数据（占用空间大）
-  memory_limit_gb: 16      # 内存使用限额（GB），从12GB增加到16GB
-
-# 数据质量配置
+  memory_max_mb: 4096
+  enable_factor_cache: false
+  memory_limit_gb: 16
 quality:
-  min_trading_days: 200     # 最少交易日数
-  check_price_relation: true # 检查价格关系合理性
-  max_change_pct: 20        # 最大单日涨跌幅
-
-# 五维复权配置
+  min_trading_days: 200
+  check_price_relation: true
+  max_change_pct: 20
 adjustment:
   enabled: true
-  types: ["none", "front", "back", "geometric_front", "geometric_back"]
-  default: "fivefold"
-
-# 数据库配置 dbfile 为数据库文件名 还需要组合路径信息
+  types:
+  - none
+  - front
+  - back
+  - geometric_front
+  - geometric_back
+  default: fivefold
 database:
-  dbfile: "stock_data.ddb"
-  batch_size: 100000
-  max_connections: 10
-  overwrite_existing: true
-
-# 下载配置
+  data_db:
+    dbfile: stock_data.duckdb
+    description: 物理表数据库（存储实际数据）
+    batch_size: 100000
+    max_connections: 10
+    overwrite_existing: true
+  view_db:
+    dbfile: stock_views.duckdb
+    description: 视图数据库（仅包含视图定义）
+    batch_size: 100000
+    max_connections: 10
+    overwrite_existing: false
 download:
   batch_size: 100
   batch_size_1m: 30
@@ -112,121 +97,85 @@ download:
   queue_size: 30
   sleep_interval: 0.3
   use_batch_download: true
-
-# 时间范围配置（天数表示）
 time_ranges:
   default:
-    start_date: "1990-01-01"
-    end_date: "today"
+    start_date: '1990-01-01'
+    end_date: today
   1d:
-    start_date: "1990-01-01"
-    end_date: "today"
+    start_date: '1990-01-01'
+    end_date: today
   1m:
     start_days: 365
-    end_date: "today"
+    end_date: today
   5m:
     start_days: 365
-    end_date: "today"
+    end_date: today
   15m:
     start_days: 365
-    end_date: "today"
+    end_date: today
   30m:
     start_days: 365
-    end_date: "today"
+    end_date: today
   60m:
     start_days: 365
-    end_date: "today"
+    end_date: today
   tick:
     start_days: 31
-    end_date: "today"
+    end_date: today
   1w:
-    start_date: "1990-01-01"
-    end_date: "today"
+    start_date: '1990-01-01'
+    end_date: today
   1M:
-    start_date: "1990-01-01"
-    end_date: "today"
-
-# 重建配置
+    start_date: '1990-01-01'
+    end_date: today
 rebuild:
-  default_mode: "immediate"
+  default_mode: immediate
   show_confirmation: true
   enable_performance_monitoring: true
   error_handling:
     retry_attempts: 3
     retry_delay: 1.0
-
-# 暂停功能配置
 pause:
-  enabled: false           # 是否启用暂停功能（默认关闭）
-  interval: 50           # 每处理多少只股票后暂停
-  duration: 3             # 暂停时长（秒）
-
-# 性能优化配置
+  enabled: false
+  interval: 50
+  duration: 3
 performance:
-  # 导入策略配置
-  import_strategy: "auto"  # auto/copy_create/copy_append/upsert/direct_insert
-  
-  # 内存管理
-  memory_limit_gb: 8.0  # 从4.0GB增加到8.0GB
+  import_strategy: auto
+  memory_limit_gb: 8.0
   batch_processing: true
   batch_size_adaptive: true
-  min_batch_size: 500  # 从1000减少到500
-  max_batch_size: 50000  # 从100000减少到50000
-  
-  # Parquet存储
+  min_batch_size: 500
+  max_batch_size: 50000
   parquet:
-    row_group_size: 50000  # 行组大小，从100000减少到50000
-    use_dictionary: true    # 使用字典编码
-    compression_level: 5    # 压缩级别，从9减少到5，提高写入速度
-    
-  # DuckDB优化
+    row_group_size: 50000
+    use_dictionary: true
+    compression_level: 5
   duckdb:
-    memory_limit: "8GB"  # 从4GB增加到8GB
-    threads: 8  # 从4增加到8，提高并行处理能力
+    memory_limit: 8GB
+    threads: 8
     enable_object_cache: true
-    
-  # 智能导入阈值
   thresholds:
-    small_data: 500    # 小数据阈值，使用direct_insert，从1000减少到500
-    large_data: 250000  # 大数据阈值，使用copy策略，从500000减少到250000
-    partition_threshold: 500000  # 分区表阈值，从1000000减少到500000
-
-# 资源管理配置
-# 用于控制数据下载和处理过程中的资源使用
+    small_data: 500
+    large_data: 250000
+    partition_threshold: 500000
 resource:
-  # 处理限额配置
-  # 这些参数用于控制每批处理的规模和资源重置的频率
-  # 处理限额配置
   processing_limit:
-    # 每批处理的最大标的数
-    # 建议值：100-200之间
-    # 内存较大的系统可以适当增加
     max_symbols_per_batch: 10
-    
-    # 每批处理的最大记录数
-    # 考虑tick数据的大量记录，建议值：1000000
-    # 内存较大的系统可以适当增加
     max_records_per_batch: 50000
-    
-    # 处理多少标的后重置资源
-    # 建议值：每批或更少重置一次
-    # 优先考虑记录数，特别是对于1分钟数据
     reset_interval_symbols: 5
-    
-    # 处理多少记录后重置资源
-    # 建议值：更频繁地重置，特别是对于1分钟数据
-    # 减少重置间隔，增加资源回收次数
     reset_interval_records: 100000
-
-# 测试配置
 test:
-  daily_stock_count: 50  # 日线数据测试模式股票数量
-  other_stock_count: 20  # 其他数据测试模式股票数量
-
-# 日志配置
+  daily_stock_count: 50
+  other_stock_count: 20
 logging:
-  level: "info"
-  file: "logs/data_manager.log"
+  level: info
+  file: logs/data_manager.log
   detailed: true
   minimal: false
   progress_interval: 10
+user_preference:
+  query_mode: table
+  cache:
+    enabled: false
+    max_size: 500
+    force_disable_on_test: true
