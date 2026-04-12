@@ -276,20 +276,52 @@ class DataManager:
         }
 
         # 检查 QMT
+        api = None
         try:
             import easy_xt
             api = easy_xt.get_api()
             if hasattr(api, 'data') and hasattr(api.data, 'get_current_price'):
-                # 尝试获取一个测试数据
-                test_df = api.data.get_current_price(['000001.SZ'])
-                if test_df is not None and not test_df.empty:
-                    source_status['qmt']['available'] = True
-                    source_status['qmt']['connected'] = True
+                # 尝试初始化数据服务
+                init_success = False
+                try:
+                    if hasattr(api, 'init_data'):
+                        init_result = api.init_data()
+                        if init_result:
+                            init_success = True
+                except Exception as init_e:
+                    # 初始化失败，继续尝试获取数据
+                    pass
+                
+                # 只有在初始化成功后才尝试获取数据
+                if init_success:
+                    # 尝试获取一个测试数据
+                    try:
+                        test_df = api.data.get_current_price(['000001.SZ'])
+                        if test_df is not None and not test_df.empty:
+                            source_status['qmt']['available'] = True
+                            source_status['qmt']['connected'] = True
+                        else:
+                            source_status['qmt']['available'] = True
+                            source_status['qmt']['connected'] = False
+                    except Exception as data_e:
+                        source_status['qmt']['available'] = True
+                        source_status['qmt']['connected'] = False
                 else:
                     source_status['qmt']['available'] = True
                     source_status['qmt']['connected'] = False
-        except:
+            else:
+                source_status['qmt']['available'] = True
+                source_status['qmt']['connected'] = False
+        except Exception as e:
+            # 捕获所有异常，避免影响其他数据源的检查
             pass
+        finally:
+            # 清理资源，避免MiniRacer异常
+            if api and hasattr(api, 'close'):
+                try:
+                    api.close()
+                except:
+                    pass
 
         # 检查 DuckDB
         try:

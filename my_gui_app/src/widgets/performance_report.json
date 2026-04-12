@@ -1,0 +1,52 @@
+{
+  "timestamp": "2026-03-30 19:12:56",
+  "test_results": [
+    {
+      "test_num": 1,
+      "start_time": "2026-03-30 19:11:56",
+      "end_time": "2026-03-30 19:11:56",
+      "duration": 0.08049702644348145
+    },
+    {
+      "test_num": 2,
+      "start_time": "2026-03-30 19:12:26",
+      "end_time": "2026-03-30 19:12:26",
+      "duration": 0.024678945541381836
+    },
+    {
+      "test_num": 3,
+      "start_time": "2026-03-30 19:12:56",
+      "end_time": "2026-03-30 19:12:56",
+      "duration": 0.022954463958740234
+    }
+  ],
+  "performance_data": [
+    {
+      "log_file": "local_data_manager_20260330_191226.log",
+      "stocks_processed": 0,
+      "total_stocks": 0,
+      "success_count": 0,
+      "failed_count": 0,
+      "total_time": 0,
+      "batch_performance": []
+    },
+    {
+      "log_file": "local_data_manager_20260330_191256.log",
+      "stocks_processed": 0,
+      "total_stocks": 0,
+      "success_count": 0,
+      "failed_count": 0,
+      "total_time": 0,
+      "batch_performance": []
+    },
+    {
+      "log_file": "local_data_manager_20260330_191156.log",
+      "stocks_processed": 0,
+      "total_stocks": 0,
+      "success_count": 0,
+      "failed_count": 0,
+      "total_time": 0,
+      "batch_performance": []
+    }
+  ]
+}
