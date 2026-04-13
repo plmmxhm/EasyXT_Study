@@ -748,22 +748,12 @@ class DataDownloadThread(QThread):
             completed_symbols = []
             failed_symbols = []
 
-            # 测试模式：只处理配置的股票或可转债数量
+            # 测试模式：使用配置文件中预设的标的
             if hasattr(self, 'test_mode') and self.test_mode:
-                # 加载配置
+                # 测试模式下使用配置文件中预设的标的，不进行数量限制
                 period = strategy.get_period()
-                if is_bond:
-                    # 可转债测试模式配置
-                    test_count = config.get_test_stock_count(period)
-                    self.symbols = self.symbols[:test_count]
-                    total = len(self.symbols)
-                    self.log(f"🔧 测试模式：{period}数据只处理前{test_count}只可转债")
-                else:
-                    # 股票测试模式配置
-                    test_count = config.get_test_stock_count(period)
-                    self.symbols = self.symbols[:test_count]
-                    total = len(self.symbols)
-                    self.log(f"🔧 测试模式：{period}数据只处理前{test_count}只股票")
+                total = len(self.symbols)
+                self.log(f"🔧 测试模式：{period}数据使用配置文件中预设的 {total} 只标的")
 
             # 保存原始股票总数
             original_total = total
@@ -2457,16 +2447,50 @@ class DataDownloadThread(QThread):
         # 批量保存所有数据
         if all_dataframes:
             try:
-                self.log(f"💾 开始批量保存 {len(all_dataframes)} 只股票的 {period} 数据到数据库...")
-                
                 # 合并所有DataFrame
                 combined_df = pd.concat(all_dataframes, ignore_index=True)
                 
-                # 使用增强管理器的专用方法批量保存
-                # 管理器内部会处理表名、冲突解决、事务等所有细节
-                saved_count = db_manager.bulk_insert_stock_data(combined_df, period)
+                # 【关键修复】获取存储选项（2026-04-12）
+                save_parquet = hasattr(self, 'save_parquet_checkbox') and self.save_parquet_checkbox.isChecked()
+                save_database = hasattr(self, 'save_to_database_checkbox') and self.save_to_database_checkbox.isChecked()
                 
-                self.log(f"✅ 成功保存 {saved_count} 条记录到数据库")
+                self.log(f"💾 开始批量保存 {len(all_dataframes)} 只股票的 {period} 数据...")
+                self.log(f"   📦 存储选项: Parquet={save_parquet}, DuckDB表={save_database}")
+                
+                saved_to_parquet = 0
+                saved_to_database = 0
+                
+                # 1. 保存到Parquet文件（如果勾选）
+                if save_parquet:
+                    try:
+                        from src.core.data.storage.parquet_manager import ParquetStorageManager
+                        parquet_manager = ParquetStorageManager()
+                        saved_to_parquet = parquet_manager.save_to_parquet(combined_df, period)
+                        self.log(f"✅ 成功保存 {saved_to_parquet} 条记录到Parquet文件")
+                    except Exception as e_parquet:
+                        self.log(f"⚠️ 保存到Parquet失败: {e_parquet}")
+                
+                # 2. 保存到DuckDB物理表（如果勾选）
+                if save_database:
+                    try:
+                        saved_to_database = db_manager.bulk_insert_stock_data(combined_df, period)
+                        self.log(f"✅ 成功保存 {saved_to_database} 条记录到DuckDB物理表")
+                    except Exception as e_db:
+                        self.log(f"❌ 保存到DuckDB表失败: {e_db}")
+                        import traceback
+                        self.log(traceback.format_exc())
+                        raise  # 重新抛出异常，让外层捕获
+                
+                # 汇总保存结果
+                total_saved = max(saved_to_parquet, saved_to_database)  # 避免重复计数
+                if save_parquet and save_database:
+                    self.log(f"💾 双重保存完成: Parquet={saved_to_parquet}条, DuckDB={saved_to_database}条")
+                elif save_parquet:
+                    self.log(f"💾 仅保存到Parquet: {saved_to_parquet}条")
+                elif save_database:
+                    self.log(f"💾 仅保存到DuckDB表: {saved_to_database}条")
+                else:
+                    self.log("⚠️ 未选择任何存储方式，数据未保存!")
                 
             except Exception as e:
                 self.log(f"❌ 批量保存失败: {e}")
@@ -3035,6 +3059,30 @@ class LocalDataManagerCLI:
         self.logger = setup_logger()
         self.performance_data = []  # 用于记录性能数据
     
+    def _get_fallback_test_symbols(self, current_symbols, period):
+        """
+        【兼容模式】当配置文件中没有测试标的时，使用旧的逻辑
+        
+        Args:
+            current_symbols: 当前股票列表
+            period: 数据周期
+            
+        Returns:
+            调整后的股票列表
+        """
+        if not current_symbols:
+            return None
+            
+        # 旧逻辑：根据数据类型使用不同的数量
+        if period == '1d':
+            fallback_symbols = current_symbols[:20]  # 减少到20只
+            self.log("🔧 兼容模式：日线数据使用前20只股票")
+        else:
+            fallback_symbols = current_symbols[:20]  # 统一使用20只
+            self.log(f"🔧 兼容模式：{period}数据使用前20只股票")
+            
+        return fallback_symbols
+
     def run_test(self, symbols=None, start_date=None, end_date=None, period='1m', db_path=None, test_mode=False, num_stocks=150):
         """运行测试
         
@@ -4330,10 +4378,41 @@ class LocalDataManagerWidget(QWidget):
         init_layout = QHBoxLayout()
         init_layout.setContentsMargins(0, 0, 0, 0)
         
-        # 第一行：首次初始化复选框
-        self.init_checkbox = QCheckBox("首次初始化：删除重建表结构")
-        self.init_checkbox.setToolTip("首次使用时勾选此项，确保表结构正确")
-        init_layout.addWidget(self.init_checkbox)
+        # 【优化2026-04-13】移除"首次初始化"复选框（与快捷操作按钮功能重复）
+        # 原因分析：
+        #   - "首次初始化：删除重建表结构" 复选框的功能已被 "⚡ 快速操作" 区域的按钮完全覆盖
+        #   - 用户可通过以下快捷按钮完成相同或更强的功能：
+        #     🔄 一键重建全部 → 删除+重建所有数据库/表/视图
+        #     📊 重建物理表 → 仅重建表结构（保留数据）
+        #     👁️ 重建视图 → 仅重建Parquet视图
+        #   - 保留该复选框会造成：
+        #     1. UI混乱（两个地方做相同的事）
+        #     2. 用户困惑（不知道该用哪个）
+        #     3. 维护成本高（需要同步两处逻辑）
+        #
+        # 【替代方案】添加引导标签，提示用户使用快捷操作区域
+        guide_label = QLabel("💡 提示：如需重建数据库，请使用下方「⚡ 快速操作」区域的按钮")
+        guide_label.setStyleSheet("""
+            color: #666;
+            font-size: 9pt;
+            font-style: italic;
+            padding: 5px;
+            background-color: #FFF9E6;
+            border-radius: 4px;
+            border: 1px dashed #FFD700;
+        """)
+        guide_label.setToolTip(
+            "快速操作按钮说明:\n\n"
+            "🔄 一键重建全部 → 完全重置（删除+重建）\n"
+            "📊 重建物理表 → 只重建表结构\n"
+            "👁️ 重建视图 → 只重建Parquet视图\n"
+            "🧹 清理临时文件 → 释放磁盘空间\n"
+            "📈 存储统计 → 查看使用情况\n\n"
+            "推荐流程:\n"
+            "  首次使用 → 点击「一键重建全部」\n"
+            "  日常维护 → 点击「重建视图」或「清理临时文件」"
+        )
+        init_layout.addWidget(guide_label)
         
         # 第二行：【重构】数据存储方式（复选框组合，支持三种模式）
         storage_layout = QHBoxLayout()
@@ -4359,7 +4438,7 @@ class LocalDataManagerWidget(QWidget):
         
         # 复选框2: 保存到DuckDB数据库表
         self.save_to_database_checkbox = QCheckBox("保存到DuckDB表")
-        self.save_to_database_checkbox.setChecked(False)  # 默认不勾选
+        self.save_to_database_checkbox.setChecked(True)  # 【修改】默认勾选（2026-04-12）确保数据同时保存到物理表
         self.save_to_database_checkbox.setToolTip(
             "✅ 勾选：数据直接保存到DuckDB物理表\n"
             "   - 使用高性能COPY/并行写入\n"
@@ -4568,6 +4647,112 @@ class LocalDataManagerWidget(QWidget):
 
         other_action_layout.addStretch()
         quick_action_layout.addLayout(other_action_layout, 0, 0, 1, 4)
+
+        # 【新增】第二行：数据库维护快捷操作（2026-04-13）
+        db_maintain_layout = QHBoxLayout()
+        
+        # 按钮1: 一键重建全部（数据库+表+视图）
+        self.rebuild_all_btn = QPushButton("🔄 一键重建全部")
+        self.rebuild_all_btn.setToolTip("删除并重建所有数据库、表和视图\n用于解决数据不一致或损坏问题")
+        self.rebuild_all_btn.clicked.connect(self._quick_rebuild_all)
+        self.rebuild_all_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #E91E63;
+                color: white;
+                border: none;
+                padding: 6px 12px;
+                border-radius: 4px;
+                font-size: 9pt;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #C2185B;
+            }
+        """)
+        db_maintain_layout.addWidget(self.rebuild_all_btn)
+
+        # 按钮2: 重建物理表
+        self.rebuild_tables_btn = QPushButton("📊 重建物理表")
+        self.rebuild_tables_btn.setToolTip("重建DuckDB物理表结构\n保留数据，只重建表定义")
+        self.rebuild_tables_btn.clicked.connect(self._quick_rebuild_tables)
+        self.rebuild_tables_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #9C27B0;
+                color: white;
+                border: none;
+                padding: 6px 12px;
+                border-radius: 4px;
+                font-size: 9pt;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #7B1FA2;
+            }
+        """)
+        db_maintain_layout.addWidget(self.rebuild_tables_btn)
+
+        # 按钮3: 重建视图
+        self.rebuild_views_btn = QPushButton("👁️ 重建视图")
+        self.rebuild_views_btn.setToolTip("重建所有Parquet视图\n用于修复视图与文件不同步问题")
+        self.rebuild_views_btn.clicked.connect(self._quick_rebuild_views)
+        self.rebuild_views_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #3F51B5;
+                color: white;
+                border: none;
+                padding: 6px 12px;
+                border-radius: 4px;
+                font-size: 9pt;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #303F9F;
+            }
+        """)
+        db_maintain_layout.addWidget(self.rebuild_views_btn)
+
+        # 按钮4: 清理临时文件
+        self.clean_temp_btn = QPushButton("🧹 清理临时文件")
+        self.clean_temp_btn.setToolTip("清理下载过程中产生的临时文件\n释放磁盘空间")
+        self.clean_temp_btn.clicked.connect(self._quick_clean_temp)
+        self.clean_temp_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #FF5722;
+                color: white;
+                border: none;
+                padding: 6px 12px;
+                border-radius: 4px;
+                font-size: 9pt;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #E64A19;
+            }
+        """)
+        db_maintain_layout.addWidget(self.clean_temp_btn)
+
+        # 按钮5: 查看存储统计
+        self.storage_stats_btn = QPushButton("📈 存储统计")
+        self.storage_stats_btn.setToolTip("查看当前存储空间使用情况\n包括Parquet文件数量、数据库大小等")
+        self.storage_stats_btn.clicked.connect(self._quick_show_storage_stats)
+        self.storage_stats_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #009688;
+                color: white;
+                border: none;
+                padding: 6px 12px;
+                border-radius: 4px;
+                font-size: 9pt;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #00796B;
+            }
+        """)
+        db_maintain_layout.addWidget(self.storage_stats_btn)
+
+        db_maintain_layout.addStretch()
+        quick_action_layout.addLayout(db_maintain_layout, 1, 0, 1, 4)
 
         # ========== QMT财务数据下载区域 ==========
         financial_group = QGroupBox("💰 QMT财务数据")
@@ -4826,26 +5011,7 @@ class LocalDataManagerWidget(QWidget):
         btn_layout.addWidget(self.manual_download_btn)
         
         # 重新生成数据库按钮
-        self.regenerate_db_btn = QPushButton("🔄 重新生成数据库视图")
-        self.regenerate_db_btn.clicked.connect(self.regenerate_database_from_parquet)
-        self.regenerate_db_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #2196F3;
-                color: white;
-                border: none;
-                padding: 8px 16px;
-                border-radius: 4px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #0b7dda;
-            }
-            QPushButton:disabled {
-                background-color: #cccccc;
-            }
-        """)
-        self.regenerate_db_btn.setMinimumWidth(180)
-        btn_layout.addWidget(self.regenerate_db_btn)
+
         
         manual_layout.addLayout(btn_layout, 5, 0, 1, 4)
 
@@ -5177,8 +5343,12 @@ class LocalDataManagerWidget(QWidget):
         else:
             self.log("日志文件初始化完成")
 
-    def _check_and_rebuild_views(self):
-        """自动检查并重建缺失的视图"""
+    def _check_and_rebuild_views(self, force_rebuild=False):
+        """自动检查并重建缺失的视图
+        
+        Args:
+            force_rebuild: 是否强制重建所有视图（即使已存在）
+        """
         try:
             from src.core.data.database.db_manager import get_db_manager
             import duckdb
@@ -5202,16 +5372,21 @@ class LocalDataManagerWidget(QWidget):
                 'stock_30m', 'stock_60m', 'stock_weekly', 'stock_monthly', 'stock_tick'
             ]
             
-            # 检查哪些视图不存在
-            missing_views = []
-            for view_name in required_views:
-                try:
-                    check_query = f"SELECT count(*) FROM information_schema.tables WHERE table_name = '{view_name}'"
-                    result = manager.query_dataframe(check_query)
-                    if result is None or result.empty or result.iloc[0, 0] == 0:
+            # 【修改】如果强制重建，则直接重建所有视图
+            if force_rebuild:
+                missing_views = required_views.copy()
+                self.log(f"🔄 强制重建模式：将重建所有 {len(missing_views)} 个视图")
+            else:
+                # 检查哪些视图不存在
+                missing_views = []
+                for view_name in required_views:
+                    try:
+                        check_query = f"SELECT count(*) FROM information_schema.tables WHERE table_name = '{view_name}'"
+                        result = manager.query_dataframe(check_query)
+                        if result is None or result.empty or result.iloc[0, 0] == 0:
+                            missing_views.append(view_name)
+                    except Exception as e:
                         missing_views.append(view_name)
-                except Exception as e:
-                    missing_views.append(view_name)
             
             if missing_views:
                 self.log(f"⚠️ 检测到 {len(missing_views)} 个视图缺失: {', '.join(missing_views)}")
@@ -6639,6 +6814,31 @@ class LocalDataManagerWidget(QWidget):
         self.progress_bar.setVisible(False)
         QMessageBox.critical(self, "下载失败", error_msg)
 
+    def _check_table_exists(self, table_name):
+        """检查表结构是否存在
+        
+        Args:
+            table_name: 表名
+            
+        Returns:
+            bool: 表是否存在
+        """
+        try:
+            import duckdb
+            db_path = self.config.get('data_paths', {}).get('root_dir', 'D:/MyStockData')
+            db_file = self.config.get('database', {}).get('data_db', {}).get('dbfile', 'stock_data.duckdb')
+            full_db_path = f"{db_path}/{db_file}"
+            
+            conn = duckdb.connect(full_db_path, read_only=True)
+            # 使用 DuckDB 正确的查询语法
+            result = conn.execute(f"SELECT table_name FROM information_schema.tables WHERE table_name = '{table_name}'").fetchall()
+            conn.close()
+            
+            return len(result) > 0
+        except Exception as e:
+            # 如果数据库文件不存在或其他错误，返回False
+            return False
+    
     def _check_table_exists_and_not_empty(self, table_name):
         """检查表是否存在且不为空"""
         try:
@@ -6801,148 +7001,11 @@ class LocalDataManagerWidget(QWidget):
             self.log(f"❌ 重建数据库视图时出错: {e}")
             return False
     
-    def regenerate_database_from_parquet(self):
-        """从现有的 Parquet 文件重新生成数据库视图
-        
-        这个方法会刷新所有的数据库视图，使其指向现有的 Parquet 文件，
-        而不需要重新下载数据。
-        """
-        try:
-            self.log("=" * 70)
-            self.log("  【从Parquet重新生成数据库】")
-            self.log("=" * 70)
-            
-            # 直接在当前进程中重建视图（避免文件锁定问题）
-            import duckdb
-            from pathlib import Path
-            
-            self.log("🔄 开始重建数据库视图...")
-            
-            # 获取数据库路径和配置
-            from src.core.utils import DownloadConfig
-            config = DownloadConfig(self.config)
-            data_config = config.get_config()
-            
-            # 【修复】优先使用新版双库架构配置（2026-04-12）
-            db_cfg = data_config.get('database', {})
-            if 'data_db' in db_cfg and 'dbfile' in db_cfg['data_db']:
-                dbfile = db_cfg['data_db']['dbfile']
-            else:
-                dbfile = db_cfg.get('dbfile', 'stock_data.duckdb')
-            data_root_dir = data_config.get('data_paths', {}).get('root_dir', 'D:/MyStockData')
-            duckdb_path = str(Path(data_root_dir) / dbfile)
-            
-            parquet_config = data_config.get('storage', {}).get('parquet', {})
-            parquet_root_dir = parquet_config.get('root_dir', 'Parquet')
-            parquet_root = Path(data_root_dir) / parquet_root_dir
-            
-            self.log(f"📂 数据库: {duckdb_path}")
-            self.log(f"📁 Parquet: {parquet_root}")
-            
-            # 连接数据库（使用 read_only 模式避免锁定问题）
-            conn = duckdb.connect(duckdb_path, read_only=False)
-            
-            # 确保所有必要的目录存在
-            for subdir in ['kline/daily', 'kline/1m', 'kline/5m', 'kline/15m', 'kline/30m', 'kline/60m', 'kline/weekly', 'kline/monthly', 'tick']:
-                (parquet_root / subdir).mkdir(parents=True, exist_ok=True)
-            
-            views_to_create = [
-                ('stock_daily', 'daily', 'date'),
-                ('stock_1m', '1m', 'datetime'),
-                ('stock_5m', '5m', 'datetime'),
-                ('stock_15m', '15m', 'datetime'),
-                ('stock_30m', '30m', 'datetime'),
-                ('stock_60m', '60m', 'datetime'),
-                ('stock_weekly', 'weekly', 'date'),
-                ('stock_monthly', 'monthly', 'date'),
-                ('stock_tick', 'tick', 'datetime'),
-            ]
-            
-            for view_name, period, date_col in views_to_create:
-                try:
-                    # 删除旧视图
-                    conn.execute(f"DROP VIEW IF EXISTS main.{view_name}")
-                    
-                    # 构建路径
-                    if period == 'tick':
-                        parquet_path = str(parquet_root / 'tick' / '**' / '*.parquet').replace('\\', '/')
-                    else:
-                        parquet_path = str(parquet_root / 'kline' / period / '**' / '*.parquet').replace('\\', '/')
-                    
-                    # 根据数据类型构建 SQL
-                    if period in ['weekly', 'monthly']:
-                        # 周线和月线：智能检测列结构
-                        check_dir = parquet_root / 'kline' / period
-                        has_files = any(check_dir.rglob('*.parquet'))
-                        
-                        if has_files:
-                            first_file = next(check_dir.rglob('*.parquet'))
-                            try:
-                                cols = conn.execute(f"DESCRIBE SELECT * FROM read_parquet('{first_file}')").fetchall()
-                                col_names = [c[0] for c in cols]
-                                has_date = 'date' in col_names or 'datetime' in col_names
-                            except:
-                                has_date = False
-                            
-                            if has_date:
-                                select_part = f"COALESCE(date, CURRENT_DATE) AS {date_col}"
-                            else:
-                                select_part = f"CURRENT_DATE AS {date_col}"
-                        else:
-                            select_part = f"CURRENT_DATE AS {date_col}"
-                    elif period == 'tick':
-                        select_part = f"COALESCE(datetime::TIMESTAMP, CURRENT_TIMESTAMP::TIMESTAMP) AS datetime"
-                    elif period == 'daily':
-                        select_part = f"COALESCE(date, CURRENT_DATE) AS date"
-                    else:
-                        select_part = f"COALESCE(datetime::TIMESTAMP, CURRENT_TIMESTAMP::TIMESTAMP) AS datetime"
-                    
-                    # 确定实际周期名称
-                    actual_period = {'weekly': '1w', 'monthly': '1M'}.get(period, period)
-                    
-                    # 创建视图
-                    sql = f"""
-                        CREATE OR REPLACE VIEW main.{view_name} AS
-                        SELECT 
-                            COALESCE(stock_code, '') AS stock_code,
-                            {select_part},
-                            COALESCE(open, 0.0) AS open,
-                            COALESCE(high, 0.0) AS high,
-                            COALESCE(low, 0.0) AS low,
-                            COALESCE(close, 0.0) AS close,
-                            COALESCE(volume, 0) AS volume,
-                            COALESCE(amount, 0.0) AS amount,
-                            'stock' as symbol_type,
-                            '{actual_period}' as period,
-                            'none' as adjust_type,
-                            1.0 as factor,
-                            CURRENT_TIMESTAMP as created_at,
-                            CURRENT_TIMESTAMP as updated_at
-                        FROM read_parquet('{parquet_path}', union_by_name=true, filename=true, hive_partitioning=true)
-                        WHERE COALESCE(stock_code, '') != ''
-                    """
-                    
-                    conn.execute(sql)
-                    self.log(f"  ✅ 创建视图: {view_name}")
-                    
-                except Exception as e:
-                    self.log(f"  ⚠️ 创建视图 {view_name} 失败: {e}")
-            
-            conn.close()
-            
-            self.log("✅ 所有视图重建成功完成")
-            self.log("📊 数据库已从现有 Parquet 文件重新生成")
-            
-            # 重新加载统计信息
-            self.load_duckdb_statistics()
-                
-        except Exception as e:
-            import traceback
-            error_msg = f"重新生成数据库失败: {str(e)}\n{traceback.format_exc()}"
-            self.log(error_msg)
+
 
     def download_stocks(self):
         """下载A股数据"""
+        import os
         if self.download_thread and self.download_thread.isRunning():
             QMessageBox.warning(self, "提示", "已有下载任务正在运行")
             return
@@ -6961,12 +7024,9 @@ class LocalDataManagerWidget(QWidget):
         start_date = start_date_qdate.toString("yyyy-MM-dd")
         end_date = end_date_qdate.toString("yyyy-MM-dd")
         
-        # 检查是否勾选了首次初始化选项
-        # 注意：首次初始化只标记需要重建，不执行实际的删除操作
-        # 实际的删除操作在用户确认重建数据库后才执行
-        if hasattr(self, 'init_checkbox') and self.init_checkbox.isChecked():
-            self.log("ℹ️ 已勾选首次初始化选项，将在确认后重建表结构...")
-            # 移除强制取消勾选的代码，保留用户的勾选状态
+        # 【优化2026-04-13】移除"首次初始化"检查逻辑
+        # 原因：该功能已合并到"⚡ 快速操作"区域的按钮中
+        # 用户现在可以通过快捷按钮直接执行重建操作，无需在下载前勾选
         
         # 获取用户选择的数据类型
         data_type_text = self.data_type_combo.currentText()
@@ -6997,55 +7057,73 @@ class LocalDataManagerWidget(QWidget):
             "tick": "tick"
         }
         
-        # 检查是否需要弹出模式选择对话框
-        need_rebuild_prompt = False
-        # 当勾选了"首次初始化"选择框时，总是弹出重建数据库对话框
-        if self.init_checkbox.isChecked():
-            need_rebuild_prompt = True
-        # 当未勾选"首次初始化"选择框但表为空时，也需要弹出对话框
-        else:
-            if data_type_text == "所有类型":
-                # 检查所有表是否都存在且不为空
-                tables = ['stock_daily', 'stock_1m', 'stock_5m', 'stock_15m', 'stock_30m', 'stock_60m', 'stock_weekly', 'stock_monthly', 'stock_tick']
-                for table in tables:
-                    if not self._check_table_exists_and_not_empty(table):
-                        need_rebuild_prompt = True
-                        break
-            else:
-                # 检查对应周期的表是否存在且不为空
-                data_type = period_map.get(data_type_text, "1d")
-                table_name = f'stock_{data_type}' if data_type != '1d' else 'stock_daily'
-                if not self._check_table_exists_and_not_empty(table_name):
-                    need_rebuild_prompt = True
+        # 【优化2026-04-13】移除下载模式选择对话框
+        # 统一按保留数据逻辑处理，不再弹出对话框
+        # 只有在表结构确实不存在时才自动重建
         
-        # 只有当需要重建时才弹出对话框
-        if need_rebuild_prompt:
-            # 弹窗提醒用户当前模式是强制初始化数据库
-            msg_box = QMessageBox()
-            msg_box.setWindowTitle("下载模式选择")
-            msg_box.setText("您选择的数据表为空，需要初始化数据库。")
-            msg_box.setInformativeText("选择 '重建数据库' 将会清空并重建表结构，所有原有数据都会丢失。\n选择 '保留数据' 将会保留现有表结构，只更新对应股票的数据。\n选择 '取消' 将会取消本次下载操作。")
+        # 检查数据库文件是否存在，不存在则创建
+        db_path = self.config.get('data_paths', {}).get('root_dir', 'D:/MyStockData')
+        db_file = self.config.get('database', {}).get('data_db', {}).get('dbfile', 'stock_data.duckdb')
+        full_db_path = f"{db_path}/{db_file}"
+        
+        # 确保数据库文件所在目录存在
+        db_dir = os.path.dirname(full_db_path)
+        if not os.path.exists(db_dir):
+            os.makedirs(db_dir, exist_ok=True)
+            self.log(f"✅ 创建数据库目录: {db_dir}")
+        
+        # 自动创建表结构（只在开始时检测一次）
+        try:
+            # 导入DuckDB存储管理器
+            from src.core.data.storage.duckdb_storage_manager import DuckDBStorageManager
             
-            # 创建自定义按钮
-            yes_button = msg_box.addButton("重建数据库", QMessageBox.YesRole)
-            no_button = msg_box.addButton("保留数据", QMessageBox.NoRole)
-            cancel_button = msg_box.addButton("取消", QMessageBox.RejectRole)
+            # 创建DuckDB存储管理器
+            db_manager = DuckDBStorageManager(full_db_path)
             
-            msg_box.setDefaultButton(no_button)
-            msg_box.setIcon(QMessageBox.Warning)
-            
-            msg_box.exec_()
-            
-            # 处理响应
-            if msg_box.clickedButton() == cancel_button:
-                return
-            elif msg_box.clickedButton() == yes_button:
-                self._rebuild_database = True
+            # 创建所有表结构
+            success, msg = db_manager.create_all_tables()
+            if success:
+                self.log("✅ 数据库表结构创建成功")
             else:
-                self._rebuild_database = False
+                self.log(f"⚠️ 数据库表结构创建失败: {msg}")
+        except Exception as e:
+            self.log(f"❌ 自动创建表结构失败: {e}")
+        
+        # 统一按保留数据逻辑处理
+        self._rebuild_database = False
+        self.log("📋 下载模式: 保留数据 (统一处理)")
+        
+        # 确定要下载的数据类型
+        if data_type_text == "所有类型":
+            # 下载所有类型数据
+            data_types = ["1d", "1w", "1M", "1m", "5m", "15m", "30m", "60m", "tick"]
         else:
-            # 表已存在且不为空，不需要重建
-            self._rebuild_database = False
+            # 只下载指定类型数据
+            data_types = [period_map.get(data_type_text, "1d")]
+        
+        # 下载数据
+        for data_type in data_types:
+            # 【优化】只检测当前数据类型的表，避免检测所有类型
+            self.log(f"\n🔄 开始下载 {data_type} 数据...")
+            
+            # 确定表名
+            table_name = f'stock_{data_type}' if data_type != '1d' else 'stock_daily'
+            
+            # 检查当前类型的表是否存在（如果不存在，前面的create_all_tables已经创建）
+            try:
+                import duckdb
+                conn = duckdb.connect(full_db_path, read_only=True)
+                result = conn.execute(f"SELECT table_name FROM information_schema.tables WHERE table_name = '{table_name}'").fetchall()
+                conn.close()
+                
+                if result:
+                    self.log(f"✅ 表 {table_name} 存在，开始下载数据")
+                else:
+                    self.log(f"⚠️ 表 {table_name} 不存在，将自动创建")
+            except Exception as e:
+                self.log(f"⚠️ 检查表 {table_name} 失败: {e}")
+        
+        # 继续执行下载逻辑...
         
         # 当选择所有周期且需要重建数据库时，添加选项
         rebuild_mode = "none"
@@ -7075,100 +7153,96 @@ class LocalDataManagerWidget(QWidget):
                 self.log("⚠️ 模式: 立即强制初始化数据库 (所有数据将被覆盖)")
             
             if rebuild_mode == "immediate":
-                # 检查是否已经通过首次初始化执行过重建
-                has_performed_initialization = hasattr(self, 'init_checkbox') and not self.init_checkbox.isChecked()
+                # 【优化2026-04-13】移除对"首次初始化"复选框的检查
+                # 现在直接执行重建操作（用户已通过对话框确认）
                 
-                if not has_performed_initialization:
-                    # 立即重建所有表
-                    start_time = time.time()
-                    tables_dropped = 0
-                    tables_failed = 0
+                # 立即重建所有表
+                start_time = time.time()
+                tables_dropped = 0
+                tables_failed = 0
+                
+                try:
+                    import duckdb
+                    db_path = self.db_path
+                    from src.core.data.database.db_manager import get_db_manager
+                    manager = get_db_manager(db_path)
+                    tables_to_drop = ['stock_daily', 'stock_1m', 'stock_5m', 'stock_15m', 'stock_30m', 'stock_60m', 'stock_weekly', 'stock_monthly', 'stock_tick']
+                    total_tables = len(tables_to_drop)
                     
-                    try:
-                        import duckdb
-                        db_path = self.db_path
-                        from src.core.data.database.db_manager import get_db_manager
-                        manager = get_db_manager(db_path)
-                        tables_to_drop = ['stock_daily', 'stock_1m', 'stock_5m', 'stock_15m', 'stock_30m', 'stock_60m', 'stock_weekly', 'stock_monthly', 'stock_tick']
-                        total_tables = len(tables_to_drop)
-                        
-                        for i, table in enumerate(tables_to_drop):
-                            try:
-                                # 先尝试删除表
-                                manager.execute_write(f"DROP TABLE IF EXISTS {table}")
-                                tables_dropped += 1
-                                self.log(f"⚠️ [{i+1}/{total_tables}] 已删除旧的 {table} 表")
-                            except Exception as e:
-                                # 如果是视图，删除视图
-                                if "is of type View" in str(e):
-                                    try:
-                                        manager.execute_write(f"DROP VIEW IF EXISTS {table}")
-                                        tables_dropped += 1
-                                        self.log(f"⚠️ [{i+1}/{total_tables}] 已删除旧的 {table} 视图")
-                                    except Exception as view_e:
-                                        tables_failed += 1
-                                        self.log(f"❌ [{i+1}/{total_tables}] 删除视图 {table} 失败: {view_e}")
-                                else:
+                    for i, table in enumerate(tables_to_drop):
+                        try:
+                            # 先尝试删除表
+                            manager.execute_write(f"DROP TABLE IF EXISTS {table}")
+                            tables_dropped += 1
+                            self.log(f"⚠️ [{i+1}/{total_tables}] 已删除旧的 {table} 表")
+                        except Exception as e:
+                            # 如果是视图，删除视图
+                            if "is of type View" in str(e):
+                                try:
+                                    manager.execute_write(f"DROP VIEW IF EXISTS {table}")
+                                    tables_dropped += 1
+                                    self.log(f"⚠️ [{i+1}/{total_tables}] 已删除旧的 {table} 视图")
+                                except Exception as view_e:
                                     tables_failed += 1
-                                    self.log(f"❌ [{i+1}/{total_tables}] 删除表 {table} 失败: {e}")
-                        
-                        # 执行CHECKPOINT操作，强制释放磁盘空间
-                        try:
-                            self.log("🔧 执行CHECKPOINT操作，释放磁盘空间...")
-                            manager.execute_write("CHECKPOINT")
-                            self.log("✅ CHECKPOINT操作完成")
-                        except Exception as e:
-                            self.log(f"⚠️ CHECKPOINT操作失败: {e}")
-                        
-                        # 删除数据库文件并重新创建（最彻底的方式）
-                        try:
-                            import os
-                            if os.path.exists(db_path):
-                                file_size_before = os.path.getsize(db_path) / (1024 * 1024)  # MB
-                                self.log(f"📊 数据库文件大小: {file_size_before:.2f} MB")
-                                
-                                # 关闭连接池
-                                from src.core.data.database.connection_pool import close_all_pools
-                                close_all_pools()
-                                self.log("✅ 已关闭所有数据库连接池")
-                                
-                                # 删除数据库文件
-                                os.remove(db_path)
-                                self.log("✅ 已删除旧的数据库文件")
-                                
-                                # 删除所有Parquet文件
-                                self._delete_parquet_files('all')
-                                
-                                # 重新创建空数据库文件
-                                import duckdb
-                                conn = duckdb.connect(database=db_path, read_only=False)
-                                conn.execute("PRAGMA memory_limit = '2GB'")
-                                conn.execute("PRAGMA threads = 1")
-                                conn.execute("PRAGMA default_order = 'asc'")
-                                # 创建一个临时表来确保数据库文件被正确创建
-                                conn.execute("CREATE TABLE IF NOT EXISTS _temp_init (id INTEGER)")
-                                conn.execute("DROP TABLE IF EXISTS _temp_init")
-                                # 执行CHECKPOINT确保数据被写入文件
-                                conn.execute("CHECKPOINT")
-                                conn.close()
-                                self.log("✅ 已创建新的空数据库文件")
-                        except Exception as e:
-                            self.log(f"⚠️ 删除数据库文件时出错: {e}")
-                        
-                        # 重建表结构
-                        self.log("🔄 开始重建数据库表结构...")
-                        if self._rebuild_database_tables(db_path):
-                            self.log("✅ 数据库表结构重建完成")
-                        else:
-                            self.log("❌ 数据库表结构重建失败")
+                                    self.log(f"❌ [{i+1}/{total_tables}] 删除视图 {table} 失败: {view_e}")
+                            else:
+                                tables_failed += 1
+                                self.log(f"❌ [{i+1}/{total_tables}] 删除表 {table} 失败: {e}")
+                    
+                    # 执行CHECKPOINT操作，强制释放磁盘空间
+                    try:
+                        self.log("🔧 执行CHECKPOINT操作，释放磁盘空间...")
+                        manager.execute_write("CHECKPOINT")
+                        self.log("✅ CHECKPOINT操作完成")
                     except Exception as e:
-                        self.log(f"❌ 重建数据库时出错: {e}")
-                    finally:
-                        elapsed_time = time.time() - start_time
-                        self.log(f"📊 重建数据库完成: 成功删除 {tables_dropped} 张表，失败 {tables_failed} 张表，耗时 {elapsed_time:.2f} 秒")
-                else:
-                    # 已经执行过首次初始化，跳过重建
-                    self.log("ℹ️ 已通过首次初始化执行过表结构重建，跳过本次重建")
+                        self.log(f"⚠️ CHECKPOINT操作失败: {e}")
+                    
+                    # 删除数据库文件并重新创建（最彻底的方式）
+                    try:
+                        import os
+                        if os.path.exists(db_path):
+                            file_size_before = os.path.getsize(db_path) / (1024 * 1024)  # MB
+                            self.log(f"📊 数据库文件大小: {file_size_before:.2f} MB")
+                            
+                            # 关闭连接池
+                            from src.core.data.database.connection_pool import close_all_pools
+                            close_all_pools()
+                            self.log("✅ 已关闭所有数据库连接池")
+                            
+                            # 删除数据库文件
+                            os.remove(db_path)
+                            self.log("✅ 已删除旧的数据库文件")
+                            
+                            # 删除所有Parquet文件
+                            self._delete_parquet_files('all')
+                            
+                            # 重新创建空数据库文件
+                            import duckdb
+                            conn = duckdb.connect(database=db_path, read_only=False)
+                            conn.execute("PRAGMA memory_limit = '2GB'")
+                            conn.execute("PRAGMA threads = 1")
+                            conn.execute("PRAGMA default_order = 'asc'")
+                            # 创建一个临时表来确保数据库文件被正确创建
+                            conn.execute("CREATE TABLE IF NOT EXISTS _temp_init (id INTEGER)")
+                            conn.execute("DROP TABLE IF EXISTS _temp_init")
+                            # 执行CHECKPOINT确保数据被写入文件
+                            conn.execute("CHECKPOINT")
+                            conn.close()
+                            self.log("✅ 已创建新的空数据库文件")
+                    except Exception as e:
+                        self.log(f"⚠️ 删除数据库文件时出错: {e}")
+                    
+                    # 重建表结构
+                    self.log("🔄 开始重建数据库表结构...")
+                    if self._rebuild_database_tables(db_path):
+                        self.log("✅ 数据库表结构重建完成")
+                    else:
+                        self.log("❌ 数据库表结构重建失败")
+                except Exception as e:
+                    self.log(f"❌ 重建数据库时出错: {e}")
+                finally:
+                    elapsed_time = time.time() - start_time
+                    self.log(f"📊 重建数据库完成: 成功删除 {tables_dropped} 张表，失败 {tables_failed} 张表，耗时 {elapsed_time:.2f} 秒")
         else:
             if self._rebuild_database:
                 # 重建对应周期的表
@@ -7223,15 +7297,23 @@ class LocalDataManagerWidget(QWidget):
         symbols = None
         if hasattr(self, 'test_mode_radio') and self.test_mode_radio.isChecked():
             test_mode = True
-            self.log("🔧 测试模式已启用：只下载前50只股票（日线）或20只股票（其他）")
-            # 使用预加载的股票列表
-            if hasattr(self, '_preloaded_stocks') and self._preloaded_stocks:
-                symbols = self._preloaded_stocks
-                self.log(f"✅ 使用预加载的股票列表，共 {len(symbols)} 只A股（已排除ETF和基金）")
-                self.log("🔧 测试模式：根据数据类型使用不同的股票数量")
-            else:
-                self.log("⚠️ 预加载的股票列表不可用，使用默认设置")
-                test_mode = False
+            self.log("🔧 测试模式已启用：使用配置文件中预设的标的")
+            # 从配置文件读取预设的标的列表
+            try:
+                test_symbols = self.config.get('test', {}).get('symbols', {})
+                sh_symbols = test_symbols.get('sh', [])
+                sz_symbols = test_symbols.get('sz', [])
+                symbols = sh_symbols + sz_symbols
+                self.log(f"✅ 从配置文件读取测试标的：沪市 {len(sh_symbols)} 只，深市 {len(sz_symbols)} 只，共 {len(symbols)} 只")
+            except Exception as e:
+                self.log(f"⚠️ 从配置文件读取测试标的失败: {e}")
+                # 回退到预加载的股票列表
+                if hasattr(self, '_preloaded_stocks') and self._preloaded_stocks:
+                    symbols = self._preloaded_stocks
+                    self.log(f"⚠️ 使用预加载的股票列表，共 {len(symbols)} 只A股（已排除ETF和基金）")
+                else:
+                    self.log("⚠️ 测试标的列表不可用，使用默认设置")
+                    test_mode = False
 
         # 设置下载状态为正在下载
         self._set_download_state(True)
@@ -7344,15 +7426,8 @@ class LocalDataManagerWidget(QWidget):
                 self.log(f"✅ 使用预加载的股票列表，共 {len(symbols)} 只A股（已排除ETF和基金）")
 
             if test_mode:
-                # 测试模式下根据数据类型使用不同的股票数量
-                if data_type == '1d':
-                    # 日线数据使用前50只股票
-                    symbols = symbols[:50] if symbols else None
-                    self.log(f"🔧 测试模式：{data_type}数据只使用前50只股票")
-                else:
-                    # 其他数据类型使用前20只股票
-                    symbols = symbols[:20] if symbols else None
-                    self.log(f"🔧 测试模式：{data_type}数据只使用前20只股票")
+                # 测试模式下使用配置文件中预设的标的，不进行数量限制
+                self.log(f"🔧 测试模式：{data_type}数据使用配置文件中预设的 {len(symbols)} 只标的")
 
             # 计算配置文件时间范围与界面选择时间范围的交集
             from datetime import datetime, timedelta
@@ -7523,16 +7598,42 @@ class LocalDataManagerWidget(QWidget):
                 self.log(f"ℹ️ 使用股票列表，共 {len(current_symbols)} 个标的")
         
             if self._test_mode:
-                # 测试模式下根据数据类型使用不同的股票数量
-                self.log("🔧 测试模式：调整股票数量...")
-                if period == '1d':
-                    # 日线数据使用前50只股票
-                    current_symbols = current_symbols[:50] if current_symbols else None
-                    self.log("🔧 测试模式：日线数据只使用前50只股票")
-                else:
-                    # 其他数据类型使用前20只股票
-                    current_symbols = current_symbols[:20] if current_symbols else None
-                    self.log(f"🔧 测试模式：{period}数据只使用前20只股票")
+                # 【优化】从配置文件加载固定测试标的（上海10只 + 深圳10只 = 20只）
+                self.log("🔧 测试模式：从配置文件加载固定测试标的...")
+                
+                try:
+                    # 从配置文件读取测试标的列表
+                    test_config = self.config.get('test', {})
+                    symbols_config = test_config.get('symbols', {})
+                    
+                    # 检查是否配置了固定测试标的
+                    if symbols_config and (symbols_config.get('sh') or symbols_config.get('sz')):
+                        # 加载上海和深圳的测试标的
+                        test_symbols_sh = symbols_config.get('sh', [])
+                        test_symbols_sz = symbols_config.get('sz', [])
+                        
+                        # 合并测试标的列表
+                        test_symbols = test_symbols_sh + test_symbols_sz
+                        
+                        if test_symbols:
+                            current_symbols = test_symbols
+                            self.log(f"✅ 从配置文件加载测试标的: {len(test_symbols)} 只")
+                            self.log(f"   - 上海市场: {len(test_symbols_sh)} 只")
+                            self.log(f"   - 深圳 市场: {len(test_symbols_sz)} 只")
+                            self.log(f"   - 标的列表: {', '.join(test_symbols[:5])}...{' 等' if len(test_symbols) > 5 else ''}")
+                        else:
+                            # 配置为空，使用兼容模式
+                            self.log("⚠️ 配置文件中测试标的是空列表，使用兼容模式")
+                            current_symbols = self._get_fallback_test_symbols(current_symbols, period)
+                    else:
+                        # 未配置symbols列表，使用兼容模式
+                        self.log("⚠️ 未找到测试标的配置，使用兼容模式")
+                        current_symbols = self._get_fallback_test_symbols(current_symbols, period)
+                        
+                except Exception as e:
+                    self.log(f"❌ 加载测试标的失败: {e}，使用兼容模式")
+                    current_symbols = self._get_fallback_test_symbols(current_symbols, period)
+                
                 self.log(f"ℹ️ 调整后股票数量: {len(current_symbols) if current_symbols else 0}")
 
             # 计算配置文件时间范围与界面选择时间范围的交集
@@ -7594,16 +7695,12 @@ class LocalDataManagerWidget(QWidget):
                 test_mode=self._test_mode,
                 preloaded_stocks=self._preloaded_stocks if hasattr(self, '_preloaded_stocks') else None
             )
-            self.log("✅ 下载线程创建成功")
-            
             # 传递重建数据库的标志
             if hasattr(self, '_rebuild_database'):
                 self.download_thread.rebuild_database = self._rebuild_database
                 self.log(f"⚙️ 传递重建数据库标志: {self._rebuild_database}")
 
-            # 连接信号
-            # 注意：这里需要将线程的 finished_signal 连接到一个新的槽函数，用于处理单个任务完成
-            # 而不是直接连接到原来弹出对话框的槽函数
+            # 连接信号和槽
             self.log("🔗 连接线程信号...")
             self.download_thread.log_signal.connect(self.log)
             self.download_thread.progress_signal.connect(self.update_progress)
@@ -7618,7 +7715,7 @@ class LocalDataManagerWidget(QWidget):
             
             # 检查线程状态
             import threading
-            self.log(f"ℹ️ 线程ID: {threading.get_ident()}")
+            self.log(f"ℹ️ 主线程ID: {threading.get_ident()}")
             self.log(f"ℹ️ 下载线程状态: {self.download_thread.isRunning()}")
 
             self.log(f"⏱️ _start_next_sequential_task 方法结束，耗时: {time.time() - start_time:.2f}秒")
@@ -8223,6 +8320,260 @@ class LocalDataManagerWidget(QWidget):
 
         if is_downloading:
             self.progress_bar.setValue(0)
+
+    # ========== 【新增】快捷操作方法（2026-04-13）==========
+    
+    def _quick_rebuild_all(self):
+        """一键重建全部：数据库 + 表 + 视图"""
+        from PyQt5.QtWidgets import QMessageBox
+        import time
+        import gc
+        
+        reply = QMessageBox.question(
+            self,
+            "确认重建全部",
+            "⚠️ 此操作将删除并重建所有数据库、表和视图！\n\n"
+            "这将:\n"
+            "  1. 删除 stock_data.duckdb（物理表数据库）\n"
+            "  2. 删除 stock_views.duckdb（视图数据库）\n"
+            "  3. 清理临时文件\n"
+            "  4. 重新创建所有表结构\n"
+            "  5. 重建所有视图\n\n"
+            "是否继续？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            self.log("🔄 开始一键重建全部...")
+            
+            try:
+                # 【关键修复】步骤0: 关闭所有数据库连接（2026-04-13）
+                self.log("🔒 正在关闭所有数据库连接...")
+                
+                try:
+                    from src.core.data.database.db_manager import get_db_manager
+                    
+                    data_db_path = f"{self.config.get('data_paths', {}).get('root_dir', 'D:/MyStockData')}/stock_data.duckdb"
+                    view_db_path = f"{self.config.get('data_paths', {}).get('root_dir', 'D:/MyStockData')}/stock_views.duckdb"
+                    
+                    # 关闭物理表库连接
+                    if hasattr(self, 'db_path') and self.db_path:
+                        try:
+                            db_manager = get_db_manager(self.db_path)
+                            db_manager.close()
+                            self.log(f"   ✅ 已关闭物理表库连接: {self.db_path}")
+                        except Exception as e_close1:
+                            self.log(f"   ⚠️ 关闭物理表库失败: {e_close1}")
+                    
+                    # 关闭视图库连接
+                    try:
+                        view_manager = get_db_manager(view_db_path)
+                        view_manager.close()
+                        self.log(f"   ✅ 已关闭视图库连接: {view_db_path}")
+                    except Exception as e_close2:
+                        self.log(f"   ⚠️ 关闭视图库失败: {e_close2}")
+                        
+                except Exception as e_mgr:
+                    self.log(f"   ⚠️ 获取数据库管理器失败: {e_mgr}")
+                
+                # 强制垃圾回收，确保资源释放
+                gc.collect()
+                time.sleep(1)  # 等待1秒让系统释放文件锁
+                
+                self.log("✅ 所有数据库连接已关闭")
+                
+                # 步骤1: 删除物理表数据库（带重试机制）
+                data_db_path = f"{self.config.get('data_paths', {}).get('root_dir', 'D:/MyStockData')}/stock_data.duckdb"
+                if Path(data_db_path).exists():
+                    max_retries = 3
+                    for attempt in range(max_retries):
+                        try:
+                            Path(data_db_path).unlink()
+                            self.log(f"✅ 已删除物理表数据库: {data_db_path}")
+                            break
+                        except PermissionError as pe:
+                            if attempt < max_retries - 1:
+                                wait_time = (attempt + 1) * 2
+                                self.log(f"⚠️ 文件被占用，等待 {wait_time} 秒后重试... (第{attempt+1}/{max_retries}次)")
+                                time.sleep(wait_time)
+                                gc.collect()
+                            else:
+                                raise Exception(f"无法删除物理表数据库（已重试{max_retries}次）: {pe}")
+                
+                # 步骤2: 删除视图数据库（带重试机制）
+                view_db_path = f"{self.config.get('data_paths', {}).get('root_dir', 'D:/MyStockData')}/stock_views.duckdb"
+                if Path(view_db_path).exists():
+                    max_retries = 3
+                    for attempt in range(max_retries):
+                        try:
+                            Path(view_db_path).unlink()
+                            self.log(f"✅ 已删除视图数据库: {view_db_path}")
+                            break
+                        except PermissionError as pe:
+                            if attempt < max_retries - 1:
+                                wait_time = (attempt + 1) * 2
+                                self.log(f"⚠️ 文件被占用，等待 {wait_time} 秒后重试... (第{attempt+1}/{max_retries}次)")
+                                time.sleep(wait_time)
+                                gc.collect()
+                            else:
+                                raise Exception(f"无法删除视图数据库（已重试{max_retries}次）: {pe}")
+                
+                # 步骤3: 清理临时文件
+                temp_dir = Path(self.config.get('data_paths', {}).get('root_dir', 'D:/MyStockData')) / 'TEMP'
+                if temp_dir.exists():
+                    import shutil
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                    self.log(f"✅ 已清理临时目录: {temp_dir}")
+                
+                # 步骤4: 重建表结构
+                self._rebuild_database_tables()
+                
+                # 步骤5: 重建视图
+                self._check_and_rebuild_views(force_rebuild=True)
+                
+                self.log("🎉 一键重建全部完成！")
+                QMessageBox.information(self, "成功", "一键重建全部已完成！")
+                
+            except Exception as e:
+                self.log(f"❌ 一键重建失败: {e}")
+                import traceback
+                self.log(traceback.format_exc())
+                QMessageBox.critical(self, "错误", f"重建失败: {str(e)}\n\n可能原因:\n• 数据库文件被其他程序占用\n• 请关闭其他使用该数据库的应用后重试")
+    
+    def _quick_rebuild_tables(self):
+        """快捷操作：重建物理表结构"""
+        self.log("📊 开始重建物理表...")
+        
+        try:
+            success = self._rebuild_database_tables()
+            
+            if success:
+                self.log("✅ 物理表重建成功！")
+                from PyQt5.QtWidgets import QMessageBox
+                QMessageBox.information(self, "成功", "物理表结构已重建！")
+            else:
+                self.log("❌ 物理表重建失败")
+                
+        except Exception as e:
+            self.log(f"❌ 物理表重建异常: {e}")
+    
+    def _quick_rebuild_views(self):
+        """快捷操作：重建视图"""
+        self.log("👁️ 开始重建视图...")
+        
+        try:
+            # 强制重建所有视图
+            self._check_and_rebuild_views(force_rebuild=True)
+            self.log("✅ 视图重建成功！")
+            
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.information(self, "成功", "所有视图已重建！")
+            
+        except Exception as e:
+            self.log(f"❌ 视图重建异常: {e}")
+    
+    def _quick_clean_temp(self):
+        """快捷操作：清理临时文件"""
+        from PyQt5.QtWidgets import QMessageBox
+        
+        reply = QMessageBox.question(
+            self,
+            "确认清理",
+            "确定要清理所有临时文件吗？\n\n"
+            "将删除 TEMP 目录下的所有内容。",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            self.log("🧹 开始清理临时文件...")
+            
+            try:
+                temp_dir = Path(self.config.get('data_paths', {}).get('root_dir', 'D:/MyStockData')) / 'TEMP'
+                
+                if temp_dir.exists():
+                    import shutil
+                    file_count = len(list(temp_dir.rglob('*')))
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                    
+                    self.log(f"✅ 已清理 {file_count} 个临时文件/目录")
+                    QMessageBox.information(self, "成功", f"已清理 {file_count} 个临时项！")
+                else:
+                    self.log("ℹ️ 临时目录不存在，无需清理")
+                    QMessageBox.information(self, "提示", "临时目录不存在，无需清理")
+                    
+            except Exception as e:
+                self.log(f"❌ 清理临时文件失败: {e}")
+                QMessageBox.critical(self, "错误", f"清理失败: {str(e)}")
+    
+    def _quick_show_storage_stats(self):
+        """快捷操作：显示存储统计信息"""
+        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QLabel, QTextEdit
+        import os
+        
+        dialog = QDialog(self)
+        dialog.setWindowTitle("📈 存储空间统计")
+        dialog.setMinimumSize(600, 400)
+        
+        layout = QVBoxLayout(dialog)
+        
+        # 统计Parquet文件
+        parquet_root = Path(self.config.get('data_paths', {}).get('root_dir', 'D:/MyStockData')) / 'Parquet'
+        parquet_count = 0
+        parquet_size = 0
+        
+        if parquet_root.exists():
+            for parquet_file in parquet_root.rglob('*.parquet'):
+                parquet_count += 1
+                parquet_size += parquet_file.stat().st_size
+        
+        # 统计数据库文件
+        root_dir = Path(self.config.get('data_paths', {}).get('root_dir', 'D:/MyStockData'))
+        data_db = root_dir / 'stock_data.duckdb'
+        view_db = root_dir / 'stock_views.duckdb'
+        
+        data_db_size = data_db.stat().st_size if data_db.exists() else 0
+        view_db_size = view_db.stat().st_size if view_db.exists() else 0
+        
+        # 格式化统计信息
+        stats_text = f"""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+           📊 存储空间使用统计报告
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【Parquet 文件】
+   📁 文件数量: {parquet_count:,} 个
+   💾 总大小: {parquet_size / (1024*1024):.2f} MB ({parquet_size / (1024*1024*1024):.2f} GB)
+   
+【DuckDB 数据库】
+   🗄️ 物理表数据库 (stock_data.duckdb): {data_db_size / (1024*1024):.2f} MB
+   👁️ 视图数据库 (stock_views.duckdb): {view_db_size / (1024*1024):.2f} MB
+   
+【总计】
+   📦 总占用空间: {(parquet_size + data_db_size + view_db_size) / (1024*1024*1024):.2f} GB
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【月分区存储详情】（按市场）
+"""
+        
+        # 按市场统计
+        for market in ['SH', 'SZ']:
+            market_parquets = list(parquet_root.rglob(f'**/{market}/*.parquet')) if parquet_root.exists() else []
+            market_count = len(market_parquets)
+            market_size = sum(p.stat().st_size for p in market_parquets)
+            
+            market_name = "上海 (SH)" if market == "SH" else "深圳 (SZ)"
+            stats_text += f"\n   {market_name}: {market_count:,} 个文件, {market_size / (1024*1024):.2f} MB"
+        
+        text_edit = QTextEdit()
+        text_edit.setReadOnly(True)
+        text_edit.setText(stats_text)
+        text_edit.setFontFamily("Consolas")
+        layout.addWidget(text_edit)
+        
+        dialog.exec_()
 
     def verify_data_integrity(self):
         """验证数据完整性"""

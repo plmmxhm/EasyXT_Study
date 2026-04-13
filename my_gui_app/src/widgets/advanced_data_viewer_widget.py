@@ -123,6 +123,18 @@ class DataLoadThread(QThread):
 
                 print(f"📊 [DataLoadThread] 查询表: {table_name}, 日期列: {date_column}")
 
+                # 【新增】智能数据源切换逻辑（2026-04-13）
+                df = self._smart_query_with_fallback(
+                    manager=manager,
+                    table_name=table_name,
+                    date_column=date_column,
+                    stock_code=self.stock_code,
+                    start_date=self.start_date,
+                    end_date=self.end_date,
+                    data_type=self.data_type,
+                    adjust_type=self.adjust_type
+                )
+
                 # 根据复权类型选择列（只适用于日线数据）
                 if self.data_type == '1d':
                     if self.adjust_type == 'none':
@@ -137,49 +149,7 @@ class DataLoadThread(QThread):
                     # 分钟线、周线、月线和Tick数据使用原始价格
                     price_cols = ['open', 'high', 'low', 'close']
 
-                # 构建查询语句，支持更多数据列
-                if self.data_type == 'tick':
-                    # Tick数据的特殊处理
-                    query = f"""
-                        SELECT
-                            {date_column},
-                            price as close,
-                            volume,
-                            amount,
-                            bid_price1,
-                            bid_volume1,
-                            ask_price1,
-                            ask_volume1,
-                            func_type
-                        FROM {table_name}
-                        WHERE stock_code = '{self.stock_code}'
-                          AND {date_column} >= '{self.start_date}'
-                          AND {date_column} <= '{self.end_date}'
-                        ORDER BY {date_column}
-                    """
-                else:
-                    # 其他数据类型
-                    query = f"""
-                        SELECT
-                            {date_column},
-                            {price_cols[0]} as open,
-                            {price_cols[1]} as high,
-                            {price_cols[2]} as low,
-                            {price_cols[3]} as close,
-                            volume,
-                            amount
-                        FROM {table_name}
-                        WHERE stock_code = '{self.stock_code}'
-                          AND {date_column} >= '{self.start_date}'
-                          AND {date_column} <= '{self.end_date}'
-                        ORDER BY {date_column}
-                    """
-
-                print(f"📝 [DataLoadThread] 执行查询:")
-                print(query)
-                
-                df = manager.query_dataframe(query)
-                print(f"✅ [DataLoadThread] 查询完成, 返回 {len(df)} 条记录")
+                print(f"📝 [DataLoadThread] 智能查询完成, 返回 {len(df) if hasattr(df, '__len__') and not df.empty else 0} 条记录")
             else:
                 # 不再使用直接的duckdb.connect，避免递归调用
                 print(f"⚠️ [DataLoadThread] DB_MANAGER_AVAILABLE={DB_MANAGER_AVAILABLE}, db_path={self.db_path}")
@@ -213,6 +183,122 @@ class DataLoadThread(QThread):
             import traceback
             error_detail = traceback.format_exc()
             self.error_occurred.emit(f"{str(e)}\n\n详细信息:\n{error_detail}")
+
+    def _smart_query_with_fallback(self, manager, table_name, date_column, 
+                                   stock_code, start_date, end_date, 
+                                   data_type, adjust_type):
+        """
+        【新增】智能数据源切换查询 - 支持自动回退
+        
+        查询优先级：
+        1. 首先尝试从数据库物理表查询（快速）
+        2. 如果表无数据或不存在，回退到Parquet视图查询（兜底）
+        
+        Args:
+            manager: 数据库管理器
+            table_name: 表名
+            date_column: 日期列名
+            stock_code: 股票代码
+            start_date: 开始日期
+            end_date: 结束日期
+            data_type: 数据类型
+            adjust_type: 复权类型
+            
+        Returns:
+            DataFrame: 查询结果
+        """
+        try:
+            # 根据复权类型选择列
+            if data_type == '1d':
+                if adjust_type == 'none':
+                    price_cols = ['open', 'high', 'low', 'close']
+                elif adjust_type == 'front':
+                    price_cols = ['open_front', 'high_front', 'low_front', 'close_front']
+                elif adjust_type == 'back':
+                    price_cols = ['open_back', 'high_back', 'low_back', 'close_back']
+                else:
+                    price_cols = ['open', 'high', 'low', 'close']
+            else:
+                price_cols = ['open', 'high', 'low', 'close']
+
+            # 构建基础查询语句
+            if data_type == 'tick':
+                base_query = f"""
+                    SELECT
+                        {date_column},
+                        price as close,
+                        volume,
+                        amount,
+                        bid_price1,
+                        bid_volume1,
+                        ask_price1,
+                        ask_volume1,
+                        func_type
+                    FROM {table_name}
+                    WHERE stock_code = '{stock_code}'
+                      AND {date_column} >= '{start_date}'
+                      AND {date_column} <= '{end_date}'
+                    ORDER BY {date_column}
+                """
+            else:
+                base_query = f"""
+                    SELECT
+                        {date_column},
+                        {price_cols[0]} as open,
+                        {price_cols[1]} as high,
+                        {price_cols[2]} as low,
+                        {price_cols[3]} as close,
+                        volume,
+                        amount
+                    FROM {table_name}
+                    WHERE stock_code = '{stock_code}'
+                      AND {date_column} >= '{start_date}'
+                      AND {date_column} <= '{end_date}'
+                    ORDER BY {date_column}
+                """
+
+            # ===== 策略1: 尝试从数据库物理表查询 =====
+            print(f"🔍 [SmartQuery] 策略1: 尝试从数据库物理表查询...")
+            
+            try:
+                df_table = manager.query_dataframe(base_query)
+                
+                if df_table is not None and not df_table.empty:
+                    print(f"✅ [SmartQuery] 物理表查询成功: {len(df_table)} 条记录")
+                    self._last_query_source = "database_table"
+                    return df_table
+                else:
+                    print(f"⚠️ [SmartQuery] 物理表无数据，准备回退到视图...")
+                    
+            except Exception as e:
+                print(f"⚠️ [SmartQuery] 物理表查询失败: {e}")
+                print(f"   原因: 可能是表不存在或结构不匹配")
+            
+            # ===== 策略2: 回退到Parquet视图查询 =====
+            print(f"🔄 [SmartQuery] 策略2: 回退到Parquet视图查询...")
+            
+            try:
+                df_view = manager.query_dataframe(base_query)
+                
+                if df_view is not None and not df_view.empty:
+                    print(f"✅ [SmartQuery] 视图查询成功: {len(df_view)} 条记录")
+                    self._last_query_source = "parquet_view"
+                    return df_view
+                else:
+                    print(f"❌ [SmartQuery] 视图也无数据")
+                    
+            except Exception as e:
+                print(f"❌ [SmartQuery] 视图查询失败: {e}")
+            
+            # ===== 最终结果：返回空DataFrame =====
+            print(f"⚠️ [SmartQuery] 所有数据源均无数据，返回空结果")
+            return pd.DataFrame()
+            
+        except Exception as e:
+            print(f"❌ [SmartQuery] 智能查询异常: {e}")
+            import traceback
+            traceback.print_exc()
+            return pd.DataFrame()
 
 
 class AdvancedDataViewerWidget(QWidget):
@@ -358,6 +444,18 @@ class AdvancedDataViewerWidget(QWidget):
         
         print("✅ 应用默认配置完成")
     
+    def _clear_cache(self):
+        """
+        清除所有缓存数据
+        """
+        try:
+            self._data_cache.clear()
+            self._cache_hits = 0
+            self._cache_misses = 0
+            print("✅ 缓存已清除")
+        except Exception as e:
+            print(f"⚠️ 清除缓存失败: {e}")
+
     def _resolve_database_path(self):
         """
         解析数据库路径（2026-04-12 重构）
@@ -1475,8 +1573,13 @@ class AdvancedDataViewerWidget(QWidget):
             """
 
             if DB_MANAGER_AVAILABLE and self.db_path:
-                manager = get_db_manager(self.db_path)
-                df = manager.query_dataframe(query)
+                try:
+                    manager = get_db_manager(self.db_path)
+                    df = manager.query_dataframe(query)
+                except Exception as e:
+                    # 表不存在或查询失败，返回空DataFrame
+                    print(f"⚠️ 查询失败: {e}，返回空DataFrame")
+                    df = pd.DataFrame()
             else:
                 # 不再使用直接的duckdb.connect，避免递归调用
                 df = pd.DataFrame()  # 空DataFrame
@@ -2146,6 +2249,35 @@ class AdvancedDataViewerWidget(QWidget):
 
     # ==================== 批量性能测试功能（2026-04-12）====================
     
+    def _get_config_test_stock_count(self) -> int:
+        """
+        获取配置文件中指定的测试标的数量（2026-04-13）
+        
+        从 config/data_config.yaml 的 test 部分读取配置的标的列表，
+        返回上海+深圳市场的标的总数
+        
+        Returns:
+            配置的测试标的总数，如果无法读取则返回0
+        """
+        try:
+            if hasattr(self, 'config') and self.config:
+                test_section = self.config.get('test', {})
+                
+                sh_stocks = test_section.get('sh', [])
+                sz_stocks = test_section.get('sz', [])
+                
+                total = len(sh_stocks) + len(sz_stocks)
+                
+                if total > 0:
+                    print(f"⚙️ [测试] 配置文件指定 {total} 只测试标的 (SH:{len(sh_stocks)} + SZ:{len(sz_stocks)})")
+                    return total
+                    
+            return 0
+            
+        except Exception as e:
+            print(f"⚠️ [测试] 读取配置文件失败: {e}")
+            return 0
+    
     def _get_max_available_stocks_for_testing(self) -> int:
         """
         获取数据库中实际可用的最大标的数量（2026-04-12）
@@ -2214,31 +2346,14 @@ class AdvancedDataViewerWidget(QWidget):
             config_group = QGroupBox("测试配置")
             config_layout = QGridLayout(config_group)
             
-            # 【新增】先查询实际可用的标的数量（2026-04-12）
-            max_available_stocks = self._get_max_available_stocks_for_testing()
-            
-            # 标的数量 - 根据实际可用数量动态设置上限
+            # 【优化】测试标的数量 - 改为显示标签（2026-04-13）
             config_layout.addWidget(QLabel("📊 测试标的数量:"), 0, 0)
-            self.test_stock_count_spin = QSpinBox()
             
-            # 【关键】根据实际可用标的数设置范围
-            if max_available_stocks > 0:
-                self.test_stock_count_spin.setRange(1, max_available_stocks)
-                self.test_stock_count_spin.setValue(min(10, max_available_stocks))  # 默认10个或全部
-                self.test_stock_count_spin.setToolTip(
-                    f"随机选择指定数量的股票进行测试\n"
-                    f"• 当前数据库可用: {max_available_stocks} 只标的\n"
-                    f"• 建议选择 5-20 只以获得代表性结果"
-                )
-            else:
-                self.test_stock_count_spin.setRange(1, 8)  # 使用默认列表
-                self.test_stock_count_spin.setValue(8)
-                self.test_stock_count_spin.setToolTip(
-                    "使用预定义的8只股票进行测试\n"
-                    "（数据库中暂无数据或连接失败）"
-                )
-                
-            config_layout.addWidget(self.test_stock_count_spin, 0, 1)
+            # 创建标签显示选中的标的数量
+            self.selected_stocks_label = QLabel("20 / 20 只可用")
+            self.selected_stocks_label.setStyleSheet("color: #2196F3; font-weight: bold;")
+            self.selected_stocks_label.setToolTip("显示当前选中的标的数量")
+            config_layout.addWidget(self.selected_stocks_label, 0, 1)
             
             # 查询方式选择
             config_layout.addWidget(QLabel("🔍 测试查询方式:"), 1, 0)
@@ -2247,8 +2362,14 @@ class AdvancedDataViewerWidget(QWidget):
             self.test_view_check.setChecked(True)
             self.test_table_check = QCheckBox("物理表查询(DuckDB)")
             self.test_table_check.setChecked(True)
+            self.test_qmt_check = QCheckBox("QMT API直读")
+            self.test_qmt_check.setChecked(True)
+            self.test_list_check = QCheckBox("列表查询(批量)")
+            self.test_list_check.setChecked(True)
             query_mode_layout.addWidget(self.test_view_check)
             query_mode_layout.addWidget(self.test_table_check)
+            query_mode_layout.addWidget(self.test_qmt_check)
+            query_mode_layout.addWidget(self.test_list_check)
             query_mode_layout.addStretch()
             config_layout.addLayout(query_mode_layout, 1, 1)
             
@@ -2273,14 +2394,178 @@ class AdvancedDataViewerWidget(QWidget):
             
             self.test_dtype_combo = dtype_combo  # 改用combo替代list
             
-            # 强制关闭缓存选项
+            # 缓存设置选项（2026-04-13 优化）
             config_layout.addWidget(QLabel("💾 缓存设置:"), 3, 0)
-            self.force_no_cache_check = QCheckBox("强制关闭缓存（推荐，确保测试准确）")
+            
+            cache_container = QHBoxLayout()
+            
+            # 强制关闭缓存选项
+            self.force_no_cache_check = QCheckBox("强制关闭缓存")
             self.force_no_cache_check.setChecked(True)
             self.force_no_cache_check.setToolTip(
                 "性能测试期间强制关闭缓存\n避免缓存影响测试结果的准确性"
             )
-            config_layout.addWidget(self.force_no_cache_check, 3, 1)
+            cache_container.addWidget(self.force_no_cache_check)
+            
+            # 【新增】缓存对比测试选项（2026-04-13）
+            self.enable_cache_compare_check = QCheckBox("🔄 缓存对比")
+            self.enable_cache_compare_check.setChecked(False)  # 默认不启用（耗时较长）
+            self.enable_cache_compare_check.setToolTip(
+                "【高级】完整缓存对比测试\n\n"
+                "启用后将执行两轮测试：\n"
+                "  第1轮: ❌ 无缓存模式\n"
+                "  第2轮: ✅ 有缓存模式\n\n"
+                "优势：\n"
+                "• 直观对比缓存性能提升效果\n"
+                "• 生成完整的缓存加速比报告\n\n"
+                "注意：\n"
+                "• 测试时间约增加一倍\n"
+                "• 建议在数据量较大时使用"
+            )
+            cache_container.addWidget(self.enable_cache_compare_check)
+            
+            config_layout.addLayout(cache_container, 3, 1)
+            
+            # 【新增】测试标的列表展示（2026-04-13）
+            config_layout.addWidget(QLabel("📋 可选标的列表:"), 4, 0)
+            
+            # 全选/取消全选功能
+            select_all_container = QHBoxLayout()
+            self.select_all_checkbox = QCheckBox("☑️ 全选")
+            self.select_all_checkbox.setChecked(True)  # 默认全选
+            
+            def toggle_select_all():
+                """切换全选状态"""
+                is_checked = self.select_all_checkbox.isChecked()
+                for checkbox, _ in self.stock_checkboxes:
+                    checkbox.setChecked(is_checked)
+                # 更新全选复选框的文字
+                if is_checked:
+                    self.select_all_checkbox.setText("☑️ 取消全选")
+                else:
+                    self.select_all_checkbox.setText("☑️ 全选")
+                update_selected_count()
+            
+            def update_select_all_state():
+                """更新全选复选框的状态"""
+                if not self.stock_checkboxes:
+                    return
+                
+                all_checked = all(checkbox.isChecked() for checkbox, _ in self.stock_checkboxes)
+                self.select_all_checkbox.setChecked(all_checked)
+                # 更新全选复选框的文字
+                if all_checked:
+                    self.select_all_checkbox.setText("☑️ 取消全选")
+                else:
+                    self.select_all_checkbox.setText("☑️ 全选")
+            
+            self.select_all_checkbox.stateChanged.connect(toggle_select_all)
+            select_all_container.addWidget(self.select_all_checkbox)
+            select_all_container.addStretch()
+            config_layout.addLayout(select_all_container, 4, 1)
+            
+            # 直接从配置文件读取标的列表，避免数据库连接问题
+            available_stocks = []
+            try:
+                # 从配置文件读取标的列表
+                import yaml
+                import os
+                
+                config_path = os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+                    'config', 'data_config.yaml'
+                )
+                
+                if os.path.exists(config_path):
+                    with open(config_path, 'r', encoding='utf-8') as f:
+                        config_data = yaml.safe_load(f)
+                    
+                    # 读取测试标的
+                    if 'test' in config_data and 'symbols' in config_data['test']:
+                        symbols_config = config_data['test']['symbols']
+                        if 'sh' in symbols_config:
+                            available_stocks.extend(symbols_config['sh'])
+                        if 'sz' in symbols_config:
+                            available_stocks.extend(symbols_config['sz'])
+            except Exception as e:
+                print(f"⚠️ 读取配置文件失败: {e}")
+                # 如果读取失败，使用默认标的列表
+                available_stocks = [
+                    '600000.SH', '600016.SH', '600019.SH', '600028.SH',
+                    '600030.SH', '600036.SH', '600048.SH', '600050.SH',
+                    '600104.SH', '600519.SH', '000001.SZ', '000002.SZ',
+                    '000063.SZ', '000069.SZ', '000100.SZ', '000333.SZ',
+                    '000338.SZ', '000651.SZ', '000776.SZ', '001979.SZ'
+                ]
+            
+            # 创建标的列表容器
+            stock_list_container = QWidget()
+            stock_list_layout = QGridLayout(stock_list_container)
+            stock_list_layout.setContentsMargins(0, 0, 0, 0)
+            stock_list_layout.setSpacing(5)
+            
+            # 横向一行四只，计算行数
+            cols = 4
+            rows = (len(available_stocks) + cols - 1) // cols
+            
+            # 存储复选框的列表，用于后续获取选中的标的
+            self.stock_checkboxes = []
+            
+            def update_selected_count():
+                """更新选中的标的数量"""
+                selected_count = sum(1 for checkbox, _ in self.stock_checkboxes if checkbox.isChecked())
+                total_count = len(self.stock_checkboxes)
+                # 更新标签显示
+                self.selected_stocks_label.setText(f"{selected_count} / {total_count} 只可用")
+                self.selected_stocks_label.setToolTip(f"当前选中 {selected_count} 只标的，共 {total_count} 只可用")
+                # 更新全选复选框的状态
+                update_select_all_state()
+            
+            for i, stock in enumerate(available_stocks):
+                row = i // cols
+                col = i % cols
+                
+                # 创建复选框和标签的容器
+                stock_item_container = QWidget()
+                stock_item_layout = QHBoxLayout(stock_item_container)
+                stock_item_layout.setContentsMargins(0, 0, 0, 0)
+                stock_item_layout.setSpacing(3)
+                
+                # 创建复选框，默认选中
+                checkbox = QCheckBox()
+                checkbox.setChecked(True)
+                checkbox.setToolTip(f"选择测试标的: {stock}")
+                # 绑定状态变化事件
+                checkbox.stateChanged.connect(update_selected_count)
+                self.stock_checkboxes.append((checkbox, stock))
+                
+                # 创建股票标签
+                stock_label = QLabel(stock)
+                stock_label.setStyleSheet("""
+                    QLabel {
+                        padding: 3px 8px;
+                        background-color: #f0f0f0;
+                        border: 1px solid #ddd;
+                        border-radius: 4px;
+                        font-size: 12px;
+                        min-width: 80px;
+                        text-align: center;
+                    }
+                """)
+                stock_label.setToolTip(f"测试标的: {stock}")
+                
+                # 添加到容器
+                stock_item_layout.addWidget(checkbox)
+                stock_item_layout.addWidget(stock_label)
+                
+                # 添加到网格布局
+                stock_list_layout.addWidget(stock_item_container, row, col)
+            
+            # 初始化选中数量
+            update_selected_count()
+            
+            # 添加到配置布局
+            config_layout.addWidget(stock_list_container, 5, 1)
             
             layout.addWidget(config_group)
             
@@ -2354,53 +2639,35 @@ class AdvancedDataViewerWidget(QWidget):
             from datetime import datetime
             
             # 获取配置
-            stock_count = self.test_stock_count_spin.value()
             use_view_query = self.test_view_check.isChecked()
             use_table_query = self.test_table_check.isChecked()
-            force_no_cache = self.force_no_cache_check.isChecked()
+            use_qmt_query = self.test_qmt_check.isChecked()
+            use_list_query = self.test_list_check.isChecked()
+            enable_cache_compare = self.enable_cache_compare_check.isChecked()
             
-            # 【优化】从下拉框获取选中的数据类型（2026-04-12）
+            # 【优化】从下拉框获取选中的数据类型
             dtype_selection = self.test_dtype_combo.currentText()
             
             if "所有类型" in dtype_selection:
-                # 选择了"所有类型"，使用全部8种类型
                 selected_types = [
                     "日线(1d)", "1分钟(1m)", "5分钟(5m)", "15分钟(15m)", 
                     "30分钟(30m)", "60分钟(60m)", "周线(weekly)", "月线(monthly)"
                 ]
-                print(f"📊 已选择: 所有数据类型（共{len(selected_types)}种）")
             else:
-                # 选择了单一类型
                 selected_types = [dtype_selection]
-                print(f"📊 已选择: 单一数据类型 - {dtype_selection}")
             
             if not selected_types:
                 QMessageBox.warning(dialog, "提示", "请至少选择一种数据类型进行测试")
                 return
             
-            if not (use_view_query or use_table_query):
+            if not (use_view_query or use_table_query or use_qmt_query):
                 QMessageBox.warning(dialog, "提示", "请至少选择一种查询方式进行测试")
                 return
-            
-            # 【关键】性能测试时强制关闭缓存
-            original_cache_state = self.cache_toggle_btn.isChecked()
-            if force_no_cache and original_cache_state:
-                self.cache_toggle_btn.click()
             
             # 禁用开始按钮防止重复运行
             dialog.findChildren(QPushButton)[0].setEnabled(False)
             
-            results = []
-            total_tests = len(selected_types) * (1 if use_view_query else 0 + 1 if use_table_query else 0) * stock_count
-            current_test = 0
-            
-            self.test_result_text.clear()
-            self.test_result_text.append("=" * 80)
-            self.test_result_text.append(f"⚡ 批量性能测试报告 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            self.test_result_text.append("=" * 80)
-            self.test_result_text.append("")
-            
-            # 【修复】数据类型映射定义移到使用之前（2026-04-12）
+            # 数据类型映射
             data_type_map = {
                 "日线(1d)": "1d",
                 "1分钟(1m)": "1m",
@@ -2412,99 +2679,139 @@ class AdvancedDataViewerWidget(QWidget):
                 "月线(monthly)": "monthly"
             }
             
-            # 获取可用的股票列表
-            self.test_status_label.setText("正在获取可用股票列表...")
-            # 【优化】传入数据类型以从对应表获取有数据的标的（2026-04-12）
-            first_type_code = data_type_map.get(selected_types[0], '1d') if selected_types else '1d'
-            available_stocks = self._get_available_stocks_for_testing(stock_count, first_type_code)
+            # 获取用户选择的标的
+            selected_stocks = []
+            if hasattr(self, 'stock_checkboxes'):
+                selected_stocks = [stock for checkbox, stock in self.stock_checkboxes if checkbox.isChecked()]
             
-            if not available_stocks:
-                self.test_result_text.append("❌ 错误：无法获取可用股票列表")
-                self.cache_toggle_btn.setChecked(original_cache_state)  # 恢复缓存状态
-                return
+            # 如果没有选择标的，使用默认方法获取
+            if not selected_stocks:
+                self.test_status_label.setText("正在获取可用股票列表...")
+                first_type_code = data_type_map.get(selected_types[0], '1d') if selected_types else '1d'
+                available_stocks = self._get_available_stocks_for_testing(10, first_type_code)  # 默认10只
+                
+                if not available_stocks:
+                    self.test_result_text.append("❌ 错误：无法获取可用股票列表")
+                    return
+                
+                selected_stocks = available_stocks
             
-            self.test_result_text.append(f"📋 测试配置:")
-            self.test_result_text.append(f"   • 标的数量: {len(available_stocks)} 只")
+            # 初始化结果
+            all_results = []
+            query_mode_count = (1 if use_view_query else 0) + (1 if use_table_query else 0) + (1 if use_qmt_query else 0) + (1 if use_list_query else 0)
             
-            # 【新增】显示标的数量调整警告（2026-04-12）
+            # 计算总测试次数，考虑缓存对比的情况
+            stock_count = len(selected_stocks)  # 使用选中的标的数量
+            if enable_cache_compare:
+                total_tests = len(selected_types) * query_mode_count * (1 if use_list_query else stock_count) * 2  # 2轮测试
+            else:
+                total_tests = len(selected_types) * query_mode_count * (1 if use_list_query else stock_count)
+            current_test = 0
+            
+            self.test_result_text.clear()
+            self.test_result_text.append("=" * 80)
+            self.test_result_text.append(f"⚡ 批量性能测试报告 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            self.test_result_text.append("=" * 80)
+            self.test_result_text.append("")
+            
+            # 显示测试配置信息
+            self.test_result_text.append("📋 测试配置")
+            self.test_result_text.append("-" * 40)
+            self.test_result_text.append(f"• 测试标的: {len(selected_stocks)} 只")
+            self.test_result_text.append(f"• 数据类型: {', '.join(selected_types)}")
+            
+            # 显示测试标的列表
+            self.test_result_text.append("• 标的列表:")
+            for i, stock in enumerate(selected_stocks):
+                self.test_result_text.append(f"  {i+1}. {stock}")
+            
+            # 显示时间范围信息
+            self.test_result_text.append("• 时间范围:")
+            self.test_result_text.append(f"  日线: 1990-01-01 ~ 至今")
+            self.test_result_text.append(f"  分钟线: 近365天")
+            self.test_result_text.append(f"  周/月线: 1990-01-01 ~ 至今")
+            
+            # 显示测试方式
+            test_modes = []
+            if use_view_query:
+                test_modes.append("视图查询(Parquet)")
+            if use_table_query:
+                test_modes.append("物理表查询(DuckDB)")
+            if use_qmt_query:
+                test_modes.append("QMT API直读")
+            if use_list_query:
+                test_modes.append("列表查询(批量)")
+            self.test_result_text.append(f"• 测试方式: {', '.join(test_modes)}")
+            
+            # 显示缓存对比状态
+            self.test_result_text.append(f"• 缓存对比: {'启用' if enable_cache_compare else '禁用'}")
+            
+            # 显示警告信息
             if hasattr(self, '_test_warning_msg') and self._test_warning_msg:
-                self.test_result_text.append(f"\n{self._test_warning_msg}")
-                self._test_warning_msg = ""  # 清除已显示的警告
-            
-            self.test_result_text.append(f"   • 数据类型: {', '.join(selected_types)}")
-            self.test_result_text.append(f"   • 视图查询: {'✅' if use_view_query else '❌'}")
-            self.test_result_text.append(f"   • 物理表查询: {'✅' if use_table_query else '❌'}")
-            self.test_result_text.append(f"   • 缓存状态: {'已禁用（测试模式）' if force_no_cache else '启用'}")
-            
-            self.test_result_text.append(f"   📅 查询时间范围: 全部数据（查询各标的实际数据范围）")
+                self.test_result_text.append("")
+                self.test_result_text.append("⚠️ 警告")
+                self.test_result_text.append("-" * 40)
+                for line in self._test_warning_msg.split('\n'):
+                    if line.strip():
+                        self.test_result_text.append(f"• {line.strip()}")
+                self.test_result_text.append("")
             
             self.test_result_text.append("")
-            self.test_result_text.append("-" * 80)
             
             # 遍历每种数据类型
             for type_display in selected_types:
                 data_type_code = data_type_map.get(type_display, "1d")
                 
-                self.test_result_text.append(f"\n📊 数据类型: {type_display} ({data_type_code})")
-                self.test_result_text.append("-" * 40)
-                
-                # 遍历每个股票
-                for idx, stock_code in enumerate(available_stocks[:stock_count]):
-                    current_test += 1
-                    progress_pct = int((current_test / total_tests) * 100)
-                    self.test_progress_bar.setValue(progress_pct)
+                # 缓存对比测试
+                if enable_cache_compare:
+                    # 第1轮: 无缓存模式
+                    self.test_result_text.append(f"📊 数据类型: {type_display} ({data_type_code}) - 无缓存模式")
+                    self.test_result_text.append("-" * 40)
                     
-                    self.test_status_label.setText(
-                        f"正在测试 [{idx+1}/{min(len(available_stocks), stock_count)}] "
-                        f"{stock_code} - {type_display} ({progress_pct}%)"
-                    )
+                    # 禁用缓存
+                    original_cache_enabled = self._cache_enabled
+                    self._cache_enabled = False
                     
-                    # 视图查询测试
-                    if use_view_query:
-                        view_result = self._single_query_test(
-                            stock_code, data_type_code, "视图查询"
-                        )
-                        results.append(view_result)
-                        # 【新增】显示错误信息（2026-04-12）
-                        error_suffix = f" | ⚠️{view_result['error']}" if view_result.get('error') else ""
-                        self.test_result_text.append(
-                            f"   {stock_code} | 视图 | {view_result['elapsed']:.3f}s | "
-                            f"{view_result['records']:,}条 | {view_result['throughput']:,.0f}/s{error_suffix}"
-                        )
+                    # 执行测试
+                    self._run_test_round(selected_stocks, data_type_code, use_view_query, use_table_query, use_qmt_query, use_list_query, current_test, total_tests, all_results)
                     
-                    # 物理表查询测试
-                    if use_table_query:
-                        table_result = self._single_query_test(
-                            stock_code, data_type_code, "物理表"
-                        )
-                        results.append(table_result)
-                        # 【新增】显示错误信息（2026-04-12）
-                        error_suffix = f" | ⚠️{table_result['error']}" if table_result.get('error') else ""
-                        self.test_result_text.append(
-                            f"   {stock_code} | 物理表 | {table_result['elapsed']:.3f}s | "
-                            f"{table_result['records']:,}条 | {table_result['throughput']:,.0f}/s{error_suffix}"
-                        )
+                    # 第2轮: 有缓存模式
+                    self.test_result_text.append(f"📊 数据类型: {type_display} ({data_type_code}) - 有缓存模式")
+                    self.test_result_text.append("-" * 40)
                     
-                    # 让UI有机会更新
-                    QApplication.processEvents()
-                    time.sleep(0.05)  # 避免过快导致界面卡顿
+                    # 启用缓存
+                    self._cache_enabled = True
+                    
+                    # 执行测试
+                    self._run_test_round(selected_stocks, data_type_code, use_view_query, use_table_query, use_qmt_query, use_list_query, current_test, total_tests, all_results)
+                    
+                    # 恢复原始缓存状态
+                    self._cache_enabled = original_cache_enabled
+                else:
+                    # 普通测试模式
+                    self.test_result_text.append(f"📊 数据类型: {type_display} ({data_type_code})")
+                    self.test_result_text.append("-" * 40)
+                    
+                    # 执行测试
+                    self._run_test_round(selected_stocks, data_type_code, use_view_query, use_table_query, use_qmt_query, use_list_query, current_test, total_tests, all_results)
             
-            # ===== 生成汇总统计 =====
-            self.test_result_text.append("\n")
-            self.test_result_text.append("=" * 80)
-            self.test_result_text.append("📈 测试结果汇总统计")
-            self.test_result_text.append("=" * 80)
+            # 汇总统计
+            self.test_result_text.append("")
+            self.test_result_text.append("-" * 80)
+            self.test_result_text.append(f"📈 汇总统计")
+            self.test_result_text.append("-" * 80)
             
             # 按查询方式分组统计
-            view_results = [r for r in results if r['mode'] == '视图查询']
-            table_results = [r for r in results if r['mode'] == '物理表']
+            view_results = [r for r in all_results if r['mode'] == '视图查询']
+            table_results = [r for r in all_results if r['mode'] == '物理表']
+            qmt_results = [r for r in all_results if r['mode'] == 'QMT_API']
             
             if view_results:
                 avg_time_v = sum(r['elapsed'] for r in view_results) / len(view_results)
                 avg_throughput_v = sum(r['throughput'] for r in view_results) / len(view_results)
                 total_records_v = sum(r['records'] for r in view_results)
                 
-                self.test_result_text.append(f"\n【视图查询(Parquet)】共 {len(view_results)} 次测试:")
+                self.test_result_text.append(f"【视图查询(Parquet)】共 {len(view_results)} 次测试:")
                 self.test_result_text.append(f"   ⏱️ 平均耗时: {avg_time_v:.3f} 秒")
                 self.test_result_text.append(f"   🚀 平均吞吐量: {avg_throughput_v:,.0f} 条/秒")
                 self.test_result_text.append(f"   📈 总记录数: {total_records_v:,} 条")
@@ -2514,150 +2821,129 @@ class AdvancedDataViewerWidget(QWidget):
                 avg_throughput_t = sum(r['throughput'] for r in table_results) / len(table_results)
                 total_records_t = sum(r['records'] for r in table_results)
                 
-                self.test_result_text.append(f"\n【物理表查询(DuckDB)】共 {len(table_results)} 次测试:")
+                self.test_result_text.append(f"【物理表查询(DuckDB)】共 {len(table_results)} 次测试:")
                 self.test_result_text.append(f"   ⏱️ 平均耗时: {avg_time_t:.3f} 秒")
                 self.test_result_text.append(f"   🚀 平均吞吐量: {avg_throughput_t:,.0f} 条/秒")
                 self.test_result_text.append(f"   📈 总记录数: {total_records_t:,} 条")
             
+            if qmt_results:
+                avg_time_q = sum(r['elapsed'] for r in qmt_results) / len(qmt_results)
+                avg_throughput_q = sum(r['throughput'] for r in qmt_results) / len(qmt_results)
+                total_records_q = sum(r['records'] for r in qmt_results)
+                
+                self.test_result_text.append(f"【QMT API直读】共 {len(qmt_results)} 次测试:")
+                self.test_result_text.append(f"   ⏱️ 平均耗时: {avg_time_q:.3f} 秒")
+                self.test_result_text.append(f"   🚀 平均吞吐量: {avg_throughput_q:,.0f} 条/秒")
+                self.test_result_text.append(f"   📈 总记录数: {total_records_q:,} 条")
+            
             # 对比分析
-            if view_results and table_results:
-                speed_ratio = avg_time_t / avg_time_v if avg_time_v > 0 else 0
-                throughput_ratio = avg_throughput_v / avg_throughput_t if avg_throughput_t > 0 else 0
-                
-                self.test_result_text.append("\n" + "-" * 40)
-                self.test_result_text.append("⚖️ 对比分析:")
-                
-                if speed_ratio < 1.0:
-                    faster = "物理表查询"
-                    ratio_text = f"{1/speed_ratio:.2f}x"
-                else:
-                    faster = "视图查询"
-                    ratio_text = f"{speed_ratio:.2f}x"
-                
-                self.test_result_text.append(f"   🏆 速度更快: {faster} ({ratio_text})")
-                self.test_result_text.append(f"   📊 吞吐量对比: 视图/物理表 = {throughput_ratio:.2f}x")
+            self.test_result_text.append("⚖️ 对比分析:")
             
-            # ===== 【新增】缓存性能对比测试（2026-04-12）=====
-            self.test_result_text.append("\n")
-            self.test_result_text.append("=" * 80)
-            self.test_result_text.append("💾 缓存性能对比测试")
-            self.test_result_text.append("=" * 80)
+            # 收集所有有结果的查询方式
+            all_modes = []
+            if view_results:
+                all_modes.append(('视图查询', avg_time_v, avg_throughput_v))
+            if table_results:
+                all_modes.append(('物理表查询', avg_time_t, avg_throughput_t))
+            if qmt_results:
+                all_modes.append(('QMT_API', avg_time_q, avg_throughput_q))
             
-            cache_comparison_results = []
+            if len(all_modes) >= 2:
+                # 找出最快的方式
+                fastest = min(all_modes, key=lambda x: x[1])
+                self.test_result_text.append(f"   🏆 速度最快: {fastest[0]} ({fastest[1]:.3f}s)")
+                
+                # 显示各模式相对最快模式的倍数
+                for name, avg_time, _ in all_modes:
+                    if name != fastest[0]:
+                        ratio = avg_time / fastest[1] if fastest[1] > 0 else 0
+                        self.test_result_text.append(f"   📊 {name} 相对速度: {ratio:.2f}x")
             
-            try:
-                # 选择第一只股票和第一种数据类型进行缓存对比
-                test_stock = available_stocks[0] if available_stocks else '000001.SZ'
-                test_type_code = data_type_map.get(selected_types[0], '1d') if selected_types else '1d'
+            # 【新增】缓存对比分析（2026-04-13）
+            if enable_cache_compare:
+                self.test_result_text.append("\n" + "-" * 80)
+                self.test_result_text.append(f"⚡ 缓存对比分析")
+                self.test_result_text.append("-" * 80)
                 
-                self.test_status_label.setText("正在执行缓存性能对比...")
+                # 按模式和缓存状态分组统计
+                no_cache_results = [r for r in all_results if "无缓存模式" in str(r.get('data_type', ''))]
+                with_cache_results = [r for r in all_results if "有缓存模式" in str(r.get('data_type', ''))]
                 
-                # 1️⃣ 无缓存查询（确保缓存已清空）
-                if self._cache_enabled:
-                    original_cache_data = self._data_cache.copy()
-                    self._data_cache.clear()
-                
-                no_cache_start = time.time()
-                no_cache_result = self._single_query_test(test_stock, test_type_code, "无缓存-视图")
-                no_cache_elapsed = time.time() - no_cache_start
-                
-                cache_comparison_results.append(no_cache_result)
-                self.test_result_text.append(f"\n📊 无缓存测试:")
-                self.test_result_text.append(f"   ⏱️ 耗时: {no_cache_elapsed:.4f}s | 📈 {no_cache_result['records']:,}条")
-                
-                # 2️⃣ 有缓存查询（先填充缓存）
-                cache_fill_start = time.time()
-                cache_fill_result = self._single_query_test(test_stock, test_type_code, "填充缓存")
-                cache_fill_elapsed = time.time() - cache_fill_start
-                
-                # 3️⃣ 从缓存读取
-                cache_hit_start = time.time()
-                if self._cache_enabled:
-                    # 模拟从缓存读取（直接返回已缓存的数据）
-                    cache_key = (test_stock, test_type_code, 
-                               self.start_date_edit.date().toString('yyyy-MM-dd'),
-                               self.end_date_edit.date().toString('yyyy-MM-dd'))
+                # 计算每种查询方式的缓存加速比
+                query_modes = ['视图查询', '物理表', 'QMT_API', '列表查询']
+                for mode in query_modes:
+                    no_cache_mode_results = [r for r in no_cache_results if mode in str(r.get('mode', ''))]
+                    with_cache_mode_results = [r for r in with_cache_results if mode in str(r.get('mode', ''))]
                     
-                    if cache_key in self._data_cache:
-                        cached_df = self._data_cache[cache_key]
-                        cache_hit_elapsed = time.time() - cache_hit_start
+                    if no_cache_mode_results and with_cache_mode_results:
+                        no_cache_time = sum(r.get('elapsed', 0) for r in no_cache_mode_results) / len(no_cache_mode_results)
+                        with_cache_time = sum(r.get('elapsed', 0) for r in with_cache_mode_results) / len(with_cache_mode_results)
                         
-                        cache_hit_result = {
-                            'stock_code': test_stock,
-                            'data_type': test_type_code,
-                            'mode': '缓存命中',
-                            'elapsed': cache_hit_elapsed,
-                            'records': len(cached_df) if hasattr(cached_df, '__len__') else 0,
-                            'throughput': (len(cached_df) / cache_hit_elapsed) if cache_hit_elapsed > 0 else 0,
-                            'level': '⚡ 极快' if cache_hit_elapsed < 0.01 else '🎯 快速',
-                            'error': None
-                        }
-                        
-                        cache_comparison_results.append(cache_hit_result)
-                        
-                        self.test_result_text.append(f"\n💾 缓存命中测试:")
-                        self.test_result_text.append(f"   ⏱️ 耗时: {cache_hit_elapsed:.6f}s | 📈 {cache_hit_result['records']:,}条")
-                        
-                        # 计算加速比
-                        speedup = no_cache_elapsed / cache_hit_elapsed if cache_hit_elapsed > 0 else 0
-                        self.test_result_text.append(f"\n🚀 缓存加速比: {speedup:.1f}x")
-                        self.test_result_text.append(f"   （缓存比无缓存快 {speedup:.1f} 倍）")
-                    else:
-                        self.test_result_text.append(f"\n⚠️ 缓存未命中（可能缓存被禁用）")
+                        if with_cache_time > 0:
+                            speedup = no_cache_time / with_cache_time
+                            self.test_result_text.append(f"• {mode}: 加速比 {speedup:.2f}x")
+                        else:
+                            self.test_result_text.append(f"• {mode}: 缓存加速效果显著")
                 
-                # 恢复原始缓存数据
-                if self._cache_enabled and 'original_cache_data' in dir():
-                    self._data_cache = original_cache_data
+                # 显示缓存命中率
+                cache_hits = getattr(self, '_cache_hits', 0)
+                cache_misses = getattr(self, '_cache_misses', 0)
+                total_cache_ops = cache_hits + cache_misses
+                if total_cache_ops > 0:
+                    hit_rate = (cache_hits / total_cache_ops) * 100
+                    self.test_result_text.append(f"• 缓存命中率: {hit_rate:.1f}%")
+                else:
+                    self.test_result_text.append(f"• 缓存命中率: 0%")
                 
-            except Exception as e:
-                self.test_result_text.append(f"\n❌ 缓存对比测试失败: {e}")
+                # 测试完成后清除缓存
+                self._clear_cache()
+                self.test_result_text.append("• 测试完成后已清除缓存")
             
-            # ===== 【新增】生成独立报告文件（2026-04-12）=====
+            # 生成独立报告文件
             report_filename = None
+            csv_filename = None
+            excel_filename = None
+            
+            # 保存测试数据供导出功能使用
+            self._last_perf_test_data = all_results
             
             try:
                 from pathlib import Path
                 from datetime import datetime
-                
+            
                 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                 report_dir = Path(__file__).parent.parent.parent / 'logs' / 'performance_reports'
                 report_dir.mkdir(parents=True, exist_ok=True)
                 
+                # 1. 保存文本报告
                 report_filename = report_dir / f'performance_report_{timestamp}.txt'
-                
                 with open(report_filename, 'w', encoding='utf-8') as f:
                     f.write(self.test_result_text.toPlainText())
+                
+                # 2. 保存CSV报告
+                csv_filename = report_dir / f'performance_report_{timestamp}.csv'
+                df_results = pd.DataFrame(all_results)
+                if not df_results.empty:
+                    df_results.to_csv(csv_filename, index=False, encoding='utf-8-sig')
+                
+                # 3. 保存Excel报告
+                try:
+                    excel_filename = report_dir / f'performance_report_{timestamp}.xlsx'
+                    df_results.to_excel(excel_filename, index=False, sheet_name='性能测试结果')
+                except Exception as excel_err:
+                    print(f"⚠️ Excel报告生成失败: {excel_err}")
                 
                 self.test_result_text.append(f"\n\n{'=' * 80}")
                 self.test_result_text.append(f"📄 独立报告已生成")
                 self.test_result_text.append(f"{'=' * 80}")
-                self.test_result_text.append(f"   📁 文件路径: {report_filename}")
                 self.test_result_text.append(f"   📅 生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-                
-                print(f"✅ 性能测试报告已保存: {report_filename}")
+                self.test_result_text.append(f"   📝 文本报告: {report_filename}")
+                self.test_result_text.append(f"   📊 CSV报告: {csv_filename}")
+                if excel_filename:
+                    self.test_result_text.append(f"   📈 Excel报告: {excel_filename}")
                 
             except Exception as e:
                 self.test_result_text.append(f"\n⚠️ 生成独立报告失败: {e}")
-            
-            # 保存测试数据供后续查看（包含缓存对比结果）
-            self._last_perf_test_data = {
-                'timestamp': datetime.now(),
-                'config': {
-                    'stock_count': stock_count,
-                    'data_types': selected_types,
-                    'use_view': use_view_query,
-                    'use_table': use_table_query,
-                    'force_no_cache': force_no_cache,
-                    'report_file': str(report_filename) if report_filename else None
-                },
-                'results': results,
-                'cache_comparison': cache_comparison_results,
-                'summary': {
-                    'view_avg_time': sum(r['elapsed'] for r in view_results) / len(view_results) if view_results else 0,
-                    'table_avg_time': sum(r['elapsed'] for r in table_results) / len(table_results) if table_results else 0,
-                    'cache_speedup': (no_cache_elapsed / cache_hit_elapsed) if ('cache_hit_elapsed' in dir() and cache_hit_elapsed > 0) else 0
-                }
-            }
             
             # 完成
             self.test_progress_bar.setValue(100)
@@ -2666,171 +2952,186 @@ class AdvancedDataViewerWidget(QWidget):
             
             dialog.findChildren(QPushButton)[0].setEnabled(True)
             
-            # 恢复缓存状态
-            if force_no_cache and original_cache_state:
-                self.cache_toggle_btn.click()
-            
-            print(f"✅ 批量性能测试完成: {total_tests} 次查询")
-            
         except Exception as e:
             print(f"❌ 批量性能测试失败: {e}")
             import traceback
             traceback.print_exc()
             self.test_result_text.append(f"\n❌ 测试出错: {str(e)}")
-    
+
     def _get_available_stocks_for_testing(self, count: int, data_type: str = '1d') -> list:
         """
-        获取用于测试的股票列表 - 优化版（2026-04-12）
+        获取用于测试的股票列表 - 简化版（2026-04-13）
         
-        改进：
-        1. 过滤掉无数据的标的
-        2. 优先选择数据量大的标的（确保测试有效）
-        3. 根据数据类型动态查询对应表
-        4. 【新增】自动限制不超过实际有数据的标的数
+        直接使用配置文件中定义的20只测试标的，确保与下载范围一致
         
         Args:
             count: 需要的标的数量
-            data_type: 数据类型（用于确定查询哪张表）
+            data_type: 数据类型
             
         Returns:
-            有数据的股票代码列表
+            测试标的列表
         """
         try:
-            # 【关键修复】根据数据存储模式选择正确的数据库（2026-04-12）
-            # 数据在Parquet中，通过视图库访问 → 应该从视图库获取股票列表
-            storage_mode = self.config.get('storage', {}).get('data_source', {}).get('mode', 'parquet')
+            # 【优先】使用类的配置属性（2026-04-13）
+            test_config = self.config.get('test', {})
+            test_symbols = test_config.get('symbols', {})
             
-            if storage_mode == 'parquet' or storage_mode == 'dual':
-                # Parquet/Dual模式：数据通过视图访问，从视图库获取
-                query_db = getattr(self, 'view_db_path', None) or self.db_path
-                print(f"🔍 [测试] 查询模式: {storage_mode} → 使用视图库")
-            else:
-                # 纯数据库模式：直接查物理表
-                query_db = self.db_path
-                print(f"🔍 [测试] 查询模式: {storage_mode} → 使用物理表库")
+            # 读取测试标的列表
+            sh_symbols = test_symbols.get('sh', [])
+            sz_symbols = test_symbols.get('sz', [])
             
-            if DB_MANAGER_AVAILABLE and query_db:
-                manager = get_db_manager(query_db)
+            config_stocks = []
+            if sh_symbols or sz_symbols:
+                config_stocks = sh_symbols + sz_symbols
+                print(f"✅ 从配置加载测试标的: {len(config_stocks)} 只")
+                print(f"   上海: {len(sh_symbols)}, 深圳: {len(sz_symbols)}")
+            
+            # 如果配置中有测试标的，直接使用
+            if config_stocks:
+                # 限制数量
+                actual_count = min(count, len(config_stocks))
+                stocks = config_stocks[:actual_count]
                 
-                print(f"🔍 [测试] 正在从数据库获取股票列表...")
-                print(f"   📁 数据库路径: {query_db}")
-                print(f"   📊 数据类型: {data_type}")
+                print(f"✅ 将使用配置中的 {len(stocks)} 只标的进行测试")
                 
-                # 【优化】根据数据类型确定查询的表和日期列（与DataLoadThread一致）
-                if data_type == '1d':
-                    source_table = 'stock_daily'
-                    date_col = 'date'
-                elif data_type == 'weekly':
-                    source_table = 'stock_weekly'
-                    date_col = 'date'
-                elif data_type == 'monthly':
-                    source_table = 'stock_monthly'
-                    date_col = 'date'
-                elif data_type == 'tick':
-                    source_table = 'stock_tick'
-                    date_col = 'datetime'
-                else:
-                    source_table = f'stock_{data_type}'
-                    date_col = 'datetime'
+                # 警告信息
+                if not hasattr(self, '_test_warning_msg'):
+                    self._test_warning_msg = ""
+                self._test_warning_msg = (
+                    f"⚠️ 测试标的信息\n"
+                    f"• 配置总数: {len(config_stocks)} 只\n"
+                    f"• 测试数量: {len(stocks)} 只\n\n"
+                    f"建议: 确保所有标的都已下载数据"
+                )
                 
-                print(f"   📋 查询表: {source_table}")
-                
-                # 【核心】获取有数据的标的及其记录数（过滤无数据标的）
-                try:
-                    df = manager.query_dataframe(f"""
-                        SELECT 
-                            stock_code,
-                            COUNT(*) as record_count,
-                            MIN({('date' if data_type in ['daily', 'weekly', 'monthly'] else 'datetime')}) as min_date,
-                            MAX({('date' if data_type in ['daily', 'weekly', 'monthly'] else 'datetime')}) as max_date
-                        FROM {source_table}
-                        WHERE stock_code IS NOT NULL AND stock_code != ''
-                        GROUP BY stock_code
-                        HAVING COUNT(*) > 0  # 【关键】确保有数据
-                        ORDER BY record_count DESC  # 按数据量降序排列
-                    """)
-                    
-                    if df is None:
-                        print(f"⚠️ [测试] 查询返回None，表 {source_table} 可能不存在")
-                        df = pd.DataFrame()
-                        
-                except Exception as query_err:
-                    print(f"❌ [测试] 查询失败: {query_err}")
-                    df = pd.DataFrame()
-                
-                if df is not None and not df.empty:
-                    total_available = len(df)  # 实际有数据的标的总数
-                    
-                    # 【关键】限制数量不超过实际有数据的标的数
-                    actual_count = min(count, total_available)
-                    stocks = df['stock_code'].tolist()[:actual_count]
-                    
-                    # 输出详细信息
-                    print(f"✅ 获取到 {len(stocks)} 只测试用股票（从 {source_table} 表）")
-                    
-                    # 【诊断】显示实际stock_code格式（2026-04-12）
-                    if len(stocks) > 0:
-                        sample_codes = stocks[:5]
-                        print(f"   📝 stock_code 格式示例: {sample_codes}")
-                        print(f"   💡 提示: 这些是数据库中存储的原始格式，将直接用于查询")
-                    
-                    # 【新增】警告信息：如果请求的数量超过实际可用数量
-                    if count > total_available:
-                        print(f"⚠️ 警告: 请求测试 {count} 只标的，但该表实际只有 {total_available} 只有数据")
-                        print(f"   📊 已自动调整为使用全部 {total_available} 只标的")
-                        
-                        # 【新增】存储警告信息供调用方使用
-                        if not hasattr(self, '_test_warning_msg'):
-                            self._test_warning_msg = ""
-                        self._test_warning_msg = (
-                            f"⚠️ 测试标的数量已自动调整\n"
-                            f"• 请求: {count} 只\n"
-                            f"• 实际有数据: {total_available} 只\n"
-                            f"• 已使用: {actual_count} 只\n\n"
-                            f"建议: 减少测试标的数量或下载更多 {data_type} 数据"
-                        )
-                    
-                    # 显示前几只的数据情况
-                    for idx, row in df.head(min(5, len(df))).iterrows():
-                        print(f"   {row['stock_code']}: {row['record_count']:,}条 | "
-                              f"{str(row['min_date'])[:10]} ~ {str(row['max_date'])[:10]}")
-                    
-                    return stocks
-                
-            # 如果数据库不可用或表为空，使用预定义列表
+                return stocks
+            
+            # 兼容模式：如果配置中没有，使用默认列表
+            print("⚠️ 配置中未找到测试标的，使用默认标的列表")
             default_stocks = [
-                '000001.SZ', '000002.SZ', '600000.SH', '600036.SH',
-                '601398.SH', '000858.SZ', '002594.SZ', '300750.SZ'
+                '600000.SH', '600036.SH', '600519.SH', '601398.SH',
+                '000001.SZ', '000002.SZ', '000858.SZ', '002594.SZ',
+                '300750.SZ'
             ]
-            print(f"⚠️ 使用默认股票列表: {len(default_stocks)} 只（数据库可能无 {data_type} 数据）")
-            return default_stocks[:count]
+            actual_count = min(count, len(default_stocks))
+            stocks = default_stocks[:actual_count]
+            
+            print(f"✅ 使用默认测试标的: {len(stocks)} 只")
+            
+            return stocks
             
         except Exception as e:
-            print(f"⚠️ 获取测试股票失败: {e}")
+            print(f"❌ 获取测试标的失败: {e}")
             import traceback
             traceback.print_exc()
-            return []
-    
-    def _single_query_test(self, stock_code: str, data_type: str, mode: str) -> dict:
+            
+            # 退回到默认标的
+            default_stocks = [
+                '600000.SH', '600036.SH', '600519.SH', '601398.SH',
+                '000001.SZ', '000002.SZ', '000858.SZ', '002594.SZ',
+                '300750.SZ'
+            ]
+            actual_count = min(count, len(default_stocks))
+            return default_stocks[:actual_count]
+
+    def _run_test_round(self, selected_stocks, data_type_code, use_view_query, use_table_query, use_qmt_query, use_list_query, current_test, total_tests, all_results):
         """
-        执行单次查询测试（2026-04-12 重构）
-        
-        【关键】使用与 DataLoadThread 完全相同的查询逻辑，
-        确保数据查看器能加载的数据这里也能查到
+        执行一轮测试（无缓存或有缓存）
         """
         import time
+        from PyQt5.QtWidgets import QApplication
         
+        # 列表查询测试（批量查询）
+        if use_list_query and selected_stocks:
+            current_test += 1
+            progress_pct = int((current_test / total_tests) * 100)
+            self.test_progress_bar.setValue(progress_pct)
+            
+            self.test_status_label.setText(
+                f"正在测试 [列表查询] {data_type_code} ({progress_pct}%)"
+            )
+            
+            list_result = self._list_query_test(selected_stocks, data_type_code, "列表查询")
+            all_results.append(list_result)
+            error_suffix = f" | ⚠️{list_result['error']}" if list_result.get('error') else ""
+            self.test_result_text.append(
+                f"   列表查询 | {list_result['elapsed']:.3f}s | "
+                f"{list_result['records']:,}条 | {list_result['throughput']:,.0f}/s{error_suffix}"
+            )
+        
+        # 遍历每个股票
+        for idx, stock_code in enumerate(selected_stocks):
+            current_test += 1
+            progress_pct = int((current_test / total_tests) * 100)
+            self.test_progress_bar.setValue(progress_pct)
+            
+            self.test_status_label.setText(
+                f"正在测试 [{idx+1}/{len(selected_stocks)}] "
+                f"{stock_code} - {data_type_code} ({progress_pct}%)"
+            )
+            
+            # 视图查询测试
+            if use_view_query:
+                view_result = self._single_query_test(
+                    stock_code, data_type_code, "视图查询"
+                )
+                all_results.append(view_result)
+                error_suffix = f" | ⚠️{view_result['error']}" if view_result.get('error') else ""
+                self.test_result_text.append(
+                    f"   {stock_code} | 视图 | {view_result['elapsed']:.3f}s | "
+                    f"{view_result['records']:,}条 | {view_result['throughput']:,.0f}/s{error_suffix}"
+                )
+
+            # 物理表查询测试
+            if use_table_query:
+                table_result = self._single_query_test(
+                    stock_code, data_type_code, "物理表"
+                )
+                all_results.append(table_result)
+                error_suffix = f" | ⚠️{table_result['error']}" if table_result.get('error') else ""
+                self.test_result_text.append(
+                    f"   {stock_code} | 物理表 | {table_result['elapsed']:.3f}s | "
+                    f"{table_result['records']:,}条 | {table_result['throughput']:,.0f}/s{error_suffix}"
+                )
+
+            # QMT API直读测试
+            if use_qmt_query:
+                qmt_result = self._single_query_test(
+                    stock_code, data_type_code, "QMT_API"
+                )
+                all_results.append(qmt_result)
+                error_suffix = f" | ⚠️{qmt_result['error']}" if qmt_result.get('error') else ""
+                self.test_result_text.append(
+                    f"   {stock_code} | QMT_API | {qmt_result['elapsed']:.3f}s | "
+                    f"{qmt_result['records']:,}条 | {qmt_result['throughput']:,.0f}/s{error_suffix}"
+                )
+            
+            # 让UI有机会更新
+            QApplication.processEvents()
+            time.sleep(0.05)
+
+    def _list_query_test(self, stock_codes: list, data_type: str, mode: str) -> dict:
+        """
+        执行列表查询测试（批量查询多个股票）
+        """
+        import time
+        from pathlib import Path
+
         result = {
-            'stock_code': stock_code,
+            'stock_code': '列表查询',
             'data_type': data_type,
             'mode': mode,
             'elapsed': 0,
             'records': 0,
             'throughput': 0,
             'level': '未知',
-            'error': None
+            'error': None,
+            'debug_info': {}
         }
-        
+
+        # 记录开始时间
+        start_time = time.time()
+
         try:
             # ===== 【核心】表名映射 - 与 DataLoadThread 完全一致 =====
             if data_type == '1d':
@@ -2848,74 +3149,337 @@ class AdvancedDataViewerWidget(QWidget):
             else:
                 table_name = f'stock_{data_type}'
                 date_col = 'datetime'
-            
+
+            # ===== 【核心】根据查询模式选择正确的数据库（2026-04-12 修复）=====
+            # 双库架构：视图查询走视图库，物理表查询走物理表库
+            if mode == '列表查询':
+                db_to_use = getattr(self, 'view_db_path', None) or self.db_path
+                mode_label = "列表查询(批量)"
+            else:
+                db_to_use = self.db_path
+                mode_label = mode
+
+            # ===== 【新增】详细调试信息输出（2026-04-12）=====
+            print(f"\n{'='*60}")
+            print(f"🔍 [{mode_label}] 开始列表查询测试")
+            print(f"{'='*60}")
+            print(f"   📌 标的数量: {len(stock_codes)}")
+            print(f"   📊 数据类型: {data_type}")
+            print(f"   📋 表/视图名: {table_name}")
+            print(f"   📁 数据库路径: {db_to_use}")
+
+            # 检查数据库文件是否存在
+            db_file = Path(db_to_use) if db_to_use else None
+            if db_file and db_file.exists():
+                file_size_mb = db_file.stat().st_size / (1024 * 1024)
+                print(f"   ✅ 数据库文件存在: {file_size_mb:.2f} MB")
+                result['debug_info']['db_exists'] = True
+                result['debug_info']['db_size_mb'] = round(file_size_mb, 2)
+            else:
+                print(f"   ❌ 数据库文件不存在: {db_to_use}")
+                result['debug_info']['db_exists'] = False
+                result['error'] = f'数据库文件不存在: {db_to_use}'
+                result['level'] = '❌ 异常'
+                return result
+
+            # 构建批量查询的SQL语句
+            stocks_str = "', '".join(stock_codes)
+            range_sql = f"""
+                SELECT
+                    COUNT(*) as cnt,
+                    MIN({date_col}) as min_date,
+                    MAX({date_col}) as max_date
+                FROM {table_name}
+                WHERE stock_code IN ('{stocks_str}')
+            """
+            print(f"   🔎 SQL语句:\n{range_sql}")
+            result['debug_info']['sql_statement'] = range_sql.strip()
+            result['debug_info']['table_name'] = table_name
+            result['debug_info']['database_path'] = str(db_to_use)
+            result['debug_info']['stock_count'] = len(stock_codes)
+
+            if DB_MANAGER_AVAILABLE and db_to_use:
+                manager = get_db_manager(db_to_use)
+                result['debug_info']['db_manager_available'] = True
+                print(f"   ✅ 数据库管理器创建成功")
+
+                try:
+                    # 执行批量查询
+                    range_df = manager.query_dataframe(range_sql)
+                    print(f"   📊 查询执行完成, 返回DataFrame: {range_df is not None}")
+
+                    if range_df is not None and not range_df.empty:
+                        total_records = int(range_df.iloc[0]['cnt'])
+                        actual_min = range_df.iloc[0]['min_date']
+                        actual_max = range_df.iloc[0]['max_date']
+
+                        result['records'] = total_records
+                        result['debug_info']['query_success'] = True
+                        result['debug_info']['raw_result'] = {
+                            'cnt': total_records,
+                            'min_date': str(actual_min) if pd.notna(actual_min) else None,
+                            'max_date': str(actual_max) if pd.notna(actual_max) else None
+                        }
+
+                        if total_records > 0:
+                            min_str = str(actual_min)[:19] if pd.notna(actual_min) else 'N/A'
+                            max_str = str(actual_max)[:19] if pd.notna(actual_max) else 'N/A'
+                            print(f"   ✅ {total_records:,} 条 | 📅 {min_str} ~ {max_str}")
+                            result['level'] = '✅ 有数据'
+                        else:
+                            print(f"   ⚠️ 表 {table_name} 中无选中标的的数据")
+                            result['error'] = f'无选中标的数据 (表:{table_name})'
+                            result['level'] = '⚠️ 无数据'
+                    else:
+                        print(f"   ⚠️ 查询返回空DataFrame")
+                        result['error'] = '查询返回空'
+                        result['debug_info']['query_returned_empty'] = True
+
+                except Exception as query_err:
+                    error_msg = str(query_err)
+                    import traceback
+                    print(f"\n   ❌ ❌ ❌ 查询执行失败 ❌ ❌ ❌")
+                    print(f"   💥 错误类型: {type(query_err).__name__}")
+                    print(f"   💥 错误信息: {error_msg}")
+                    print(f"   📋 完整堆栈:")
+                    traceback.print_exc()
+                    result['error'] = error_msg
+                    result['level'] = '❌ 失败'
+                    result['debug_info']['exception_type'] = type(query_err).__name__
+                    result['debug_info']['exception_message'] = error_msg
+            else:
+                print(f"   ❌ 数据库不可用")
+                print(f"      - DB_MANAGER_AVAILABLE: {DB_MANAGER_AVAILABLE}")
+                print(f"      - db_to_use: {db_to_use}")
+                result['error'] = '数据库不可用'
+                result['debug_info']['db_manager_available'] = DB_MANAGER_AVAILABLE
+                result['debug_info']['db_path_provided'] = bool(db_to_use)
+
+        except Exception as e:
+            error_msg = str(e)
+            import traceback
+            print(f"\n   ❌ ❌ ❌ 列表查询测试失败 ❌ ❌ ❌")
+            print(f"   💥 错误类型: {type(e).__name__}")
+            print(f"   💥 错误信息: {error_msg}")
+            print(f"   📋 完整堆栈:")
+            traceback.print_exc()
+            result['error'] = error_msg
+            result['level'] = '❌ 失败'
+            result['debug_info']['exception_type'] = type(e).__name__
+            result['debug_info']['exception_message'] = error_msg
+
+        # 计算耗时和吞吐量
+        end_time = time.time()
+        elapsed = end_time - start_time
+        result['elapsed'] = elapsed
+
+        if elapsed > 0 and result['records'] > 0:
+            result['throughput'] = result['records'] / elapsed
+
+        print(f"   ⏱️ 耗时: {elapsed:.3f}s")
+        print(f"   🚀 吞吐量: {result['throughput']:.0f}条/秒")
+        print(f"{'='*60}")
+
+        return result
+
+    def _single_query_test(self, stock_code: str, data_type: str, mode: str) -> dict:
+        """
+        执行单次查询测试（2026-04-12 重构）
+
+        【关键】使用与 DataLoadThread 完全相同的查询逻辑，
+        确保数据查看器能加载的数据这里也能查到
+        """
+        import time
+        from pathlib import Path
+
+        result = {
+            'stock_code': stock_code,
+            'data_type': data_type,
+            'mode': mode,
+            'elapsed': 0,
+            'records': 0,
+            'throughput': 0,
+            'level': '未知',
+            'error': None,
+            'debug_info': {}  # 【新增】存储调试信息
+        }
+
+        # 记录开始时间
+        start_time = time.time()
+
+        try:
+            # ===== 【核心】表名映射 - 与 DataLoadThread 完全一致 =====
+            if data_type == '1d':
+                table_name = 'stock_daily'
+                date_col = 'date'
+            elif data_type == 'weekly':
+                table_name = 'stock_weekly'
+                date_col = 'date'
+            elif data_type == 'monthly':
+                table_name = 'stock_monthly'
+                date_col = 'date'
+            elif data_type == 'tick':
+                table_name = 'stock_tick'
+                date_col = 'datetime'
+            else:
+                table_name = f'stock_{data_type}'
+                date_col = 'datetime'
+
             # ===== 【核心】根据查询模式选择正确的数据库（2026-04-12 修复）=====
             # 双库架构：视图查询走视图库，物理表查询走物理表库
             if mode == '视图查询':
-                # 视图查询：使用视图数据库（stock_views.duckdb）
                 db_to_use = getattr(self, 'view_db_path', None) or self.db_path
                 mode_label = "视图(Parquet)"
             elif mode == '物理表':
-                # 物理表查询：使用物理表数据库（stock_data.duckdb/.ddb）
                 db_to_use = self.db_path
                 mode_label = "物理表(DuckDB)"
+            elif mode == 'QMT_API':
+                db_to_use = None
+                mode_label = "QMT_API"
             else:
-                # 兼容其他模式，默认使用主数据库
                 db_to_use = self.db_path
                 mode_label = mode
             
-            print(f"   🔍 [{mode_label}] {stock_code} | 表: {table_name} | 类型: {data_type}")
-            print(f"   📁 数据库: {db_to_use}")
-            
-            start_time = time.time()
-            
+            # ===== QMT API直接读取模式 =====
+            if mode == 'QMT_API':
+                return self._qmt_api_query_test(stock_code, data_type, result, start_time)
+
+            # ===== 【新增】详细调试信息输出（2026-04-12）=====
+            print(f"\n{'='*60}")
+            print(f"🔍 [{mode_label}] 开始查询测试")
+            print(f"{'='*60}")
+            print(f"   📌 标的代码: {stock_code}")
+            print(f"   📊 数据类型: {data_type}")
+            print(f"   📋 表/视图名: {table_name}")
+            print(f"   📁 数据库路径: {db_to_use}")
+
+            # 检查数据库文件是否存在
+            db_file = Path(db_to_use) if db_to_use else None
+            if db_file and db_file.exists():
+                file_size_mb = db_file.stat().st_size / (1024 * 1024)
+                print(f"   ✅ 数据库文件存在: {file_size_mb:.2f} MB")
+                result['debug_info']['db_exists'] = True
+                result['debug_info']['db_size_mb'] = round(file_size_mb, 2)
+            else:
+                print(f"   ❌ 数据库文件不存在: {db_to_use}")
+                result['debug_info']['db_exists'] = False
+                result['error'] = f'数据库文件不存在: {db_to_use}'
+                result['level'] = '❌ 异常'
+                return result
+
+            # 构建实际执行的SQL语句
+            range_sql = f"""
+                SELECT
+                    COUNT(*) as cnt,
+                    MIN({date_col}) as min_date,
+                    MAX({date_col}) as max_date
+                FROM {table_name}
+                WHERE stock_code = '{stock_code}'
+            """
+            print(f"   🔎 SQL语句:\n{range_sql}")
+            result['debug_info']['sql_statement'] = range_sql.strip()
+            result['debug_info']['table_name'] = table_name
+            result['debug_info']['database_path'] = str(db_to_use)
+            result['debug_info']['stock_code'] = stock_code
+
             if DB_MANAGER_AVAILABLE and db_to_use:
                 manager = get_db_manager(db_to_use)
-                
+                result['debug_info']['db_manager_available'] = True
+                print(f"   ✅ 数据库管理器创建成功")
+
                 try:
-                    # 查询该标的的总记录数和实际日期范围（不限制时间范围）
-                    range_sql = f"""
-                        SELECT 
-                            COUNT(*) as cnt,
-                            MIN({date_col}) as min_date,
-                            MAX({date_col}) as max_date
-                        FROM {table_name}
-                        WHERE stock_code = '{stock_code}'
-                    """
+                    # 【注意】range_sql 已在上面定义，这里直接使用
                     range_df = manager.query_dataframe(range_sql)
-                    
+                    print(f"   📊 查询执行完成, 返回DataFrame: {range_df is not None}")
+
                     if range_df is not None and not range_df.empty:
                         total_for_stock = int(range_df.iloc[0]['cnt'])
                         actual_min = range_df.iloc[0]['min_date']
                         actual_max = range_df.iloc[0]['max_date']
-                        
+
                         result['records'] = total_for_stock
-                        
+                        result['debug_info']['query_success'] = True
+                        result['debug_info']['raw_result'] = {
+                            'cnt': total_for_stock,
+                            'min_date': str(actual_min) if pd.notna(actual_min) else None,
+                            'max_date': str(actual_max) if pd.notna(actual_max) else None
+                        }
+
                         if total_for_stock > 0:
                             min_str = str(actual_min)[:19] if pd.notna(actual_min) else 'N/A'
                             max_str = str(actual_max)[:19] if pd.notna(actual_max) else 'N/A'
                             print(f"   ✅ {total_for_stock:,} 条 | 📅 {min_str} ~ {max_str}")
                             result['level'] = '✅ 有数据'
                         else:
-                            print(f"   ⚠️ 表 {table_name} 中无 {stock_code} 的数据")
-                            result['error'] = f'无 {stock_code} 数据'
+                            # 【新增】查询返回0条数据时的详细诊断信息（2026-04-12）
+                            print(f"\n   ⚠️ ⚠️ ⚠️ 表 {table_name} 中无 {stock_code} 的数据 ⚠️ ⚠️ ⚠️")
+                            print(f"   🔍 诊断信息:")
+                            print(f"      - 表名: {table_name}")
+                            print(f"      - 标的: {stock_code}")
+                            print(f"      - 数据库: {db_to_use}")
+
+                            # 尝试获取表中的所有标的列表，帮助诊断
+                            try:
+                                check_sql = f"SELECT DISTINCT stock_code FROM {table_name} LIMIT 10"
+                                sample_stocks = manager.query_dataframe(check_sql)
+                                if sample_stocks is not None and not sample_stocks.empty:
+                                    stocks_list = sample_stocks['stock_code'].tolist()
+                                    print(f"      - 表中前10个标的: {stocks_list}")
+                                    result['debug_info']['sample_stocks_in_table'] = stocks_list
+                                else:
+                                    print(f"      - ⚠️ 表 {table_name} 完全为空或不存在")
+                                    result['debug_info']['table_empty'] = True
+                            except Exception as diag_err:
+                                print(f"      - ❌ 获取标的列表失败: {diag_err}")
+                                result['debug_info']['diagnosis_error'] = str(diag_err)
+
+                            # 检查表是否存在
+                            try:
+                                table_check_sql = f"""SELECT table_name FROM information_schema.tables
+                                                     WHERE table_name = '{table_name}'"""
+                                table_exists_df = manager.query_dataframe(table_check_sql)
+                                if table_exists_df is not None and not table_exists_df.empty:
+                                    print(f"      - ✅ 表 {table_name} 存在于数据库中")
+                                    result['debug_info']['table_exists'] = True
+                                else:
+                                    print(f"      - ❌ 表 {table_name} 不存在于数据库中！")
+                                    result['debug_info']['table_exists'] = False
+                            except Exception as table_err:
+                                print(f"      - ⚠️ 无法检查表是否存在: {table_err}")
+
+                            result['error'] = f'无 {stock_code} 数据 (表:{table_name})'
                             result['level'] = '⚠️ 无数据'
                     else:
+                        print(f"   ⚠️ 查询返回空DataFrame")
                         result['error'] = '查询返回空'
-                        
+                        result['debug_info']['query_returned_empty'] = True
+
                 except Exception as query_err:
                     error_msg = str(query_err)
-                    print(f"   ❌ 失败: {error_msg}")
+                    import traceback
+                    print(f"\n   ❌ ❌ ❌ 查询执行失败 ❌ ❌ ❌")
+                    print(f"   💥 错误类型: {type(query_err).__name__}")
+                    print(f"   💥 错误信息: {error_msg}")
+                    print(f"   📋 完整堆栈:")
+                    traceback.print_exc()
                     result['error'] = error_msg
                     result['level'] = '❌ 失败'
+                    result['debug_info']['exception_type'] = type(query_err).__name__
+                    result['debug_info']['exception_message'] = error_msg
             else:
+                print(f"   ❌ 数据库不可用")
+                print(f"      - DB_MANAGER_AVAILABLE: {DB_MANAGER_AVAILABLE}")
+                print(f"      - db_to_use: {db_to_use}")
                 result['error'] = '数据库不可用'
-            
+                result['debug_info']['db_manager_available'] = DB_MANAGER_AVAILABLE
+                result['debug_info']['db_path_provided'] = bool(db_to_use)
+
             result['elapsed'] = time.time() - start_time
-            
+            print(f"   ⏱️ 查询耗时: {result['elapsed']:.4f}s")
+
             if result['elapsed'] > 0 and result['records'] > 0:
                 result['throughput'] = result['records'] / result['elapsed']
-            
+
             if not result.get('level') or result['level'] == '未知':
                 if result['elapsed'] < 0.05:
                     result['level'] = '⚡ 极快'
@@ -2925,13 +3489,156 @@ class AdvancedDataViewerWidget(QWidget):
                     result['level'] = '🔄 正常'
                 else:
                     result['level'] = '🐢 较慢'
-                    
+
         except Exception as e:
+            error_msg = str(e)
+            import traceback
+            print(f"\n   💥💥💥 异常外层捕获 💥💥💥")
+            print(f"   错误: {error_msg}")
+            traceback.print_exc()
+            result['error'] = error_msg
+            result['level'] = '❌ 异常'
+            result['debug_info']['outer_exception'] = error_msg
+
+        return result
+
+    def _qmt_api_query_test(self, stock_code: str, data_type: str, result: dict, start_time: float) -> dict:
+        """
+        QMT API直接读取性能测试（2026-04-13 新增）
+
+        直接使用QMT API读取数据，不经过任何中间存储
+        用于与视图查询、物理表查询进行性能对比
+        """
+        import time
+        from datetime import datetime, timedelta
+
+        print(f"\n{'='*60}")
+        print(f"🔍 [QMT_API] 开始直接读取测试")
+        print(f"{'='*60}")
+        print(f"   📌 标的代码: {stock_code}")
+        print(f"   📊 数据类型: {data_type}")
+
+        try:
+            from xtquant import xtdata
+
+            # 确定时间范围
+            if data_type == '1d':
+                start_date = '1990-01-01'
+                end_date = datetime.now().strftime('%Y-%m-%d')
+                period = '1d'
+            elif data_type in ['weekly', 'monthly']:
+                start_date = '1990-01-01'
+                end_date = datetime.now().strftime('%Y-%m-%d')
+                period = data_type
+            else:
+                # 分钟线 - 使用最近365天
+                start_date = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
+                end_date = datetime.now().strftime('%Y-%m-%d')
+                period = data_type
+
+            print(f"   📅 时间范围: {start_date} ~ {end_date}")
+
+            # 转换日期格式为QMT API要求的格式（不带连字符）
+            start_str = start_date.replace('-', '')
+            end_str = end_date.replace('-', '')
+            
+            # 1. 优先从缓存读取数据（测试前已下载）
+            print(f"   🔍 优先从缓存读取数据...")
+            try:
+                fields = ['open', 'high', 'low', 'close', 'volume', 'amount']
+                data = xtdata.get_market_data_ex(
+                    field_list=fields,
+                    stock_list=[stock_code],
+                    period=period,
+                    start_time=start_str,
+                    end_time=end_str,
+                    count=-1,
+                    dividend_type='none',
+                    fill_data=True
+                )
+
+                # 转换为DataFrame
+                if data and stock_code in data:
+                    stock_data = data[stock_code]
+                    if isinstance(stock_data, pd.DataFrame) and not stock_data.empty:
+                        print(f"   ✅ 从缓存读取成功，数据形状: {stock_data.shape}")
+                        df = stock_data
+                    else:
+                        df = pd.DataFrame()
+                else:
+                    df = pd.DataFrame()
+            except Exception as e:
+                print(f"   ⚠️ 缓存读取失败: {e}")
+                df = pd.DataFrame()
+
+            # 2. 如果缓存无数据，下载数据
+            if df is None or df.empty:
+                print(f"   📥 缓存无数据，开始下载...")
+                try:
+                    # 直接使用完整的时间范围，不再限制分钟数据
+                    download_start = start_str
+                    download_end = end_str
+
+                    xtdata.download_history_data2(
+                        stock_list=[stock_code],
+                        period=period,
+                        start_time=download_start,
+                        end_time=download_end
+                    )
+                    print(f"   ✅ 数据下载完成")
+
+                    # 再次尝试读取
+                    fields = ['open', 'high', 'low', 'close', 'volume', 'amount']
+                    data = xtdata.get_market_data_ex(
+                        field_list=fields,
+                        stock_list=[stock_code],
+                        period=period,
+                        start_time=start_str,
+                        end_time=end_str,
+                        count=-1,
+                        dividend_type='none',
+                        fill_data=True
+                    )
+
+                    if data and stock_code in data:
+                        stock_data = data[stock_code]
+                        if isinstance(stock_data, pd.DataFrame) and not stock_data.empty:
+                            print(f"   ✅ 下载后读取成功，数据形状: {stock_data.shape}")
+                            df = stock_data
+                        else:
+                            df = pd.DataFrame()
+                    else:
+                        df = pd.DataFrame()
+                except Exception as e:
+                    print(f"   ❌ 下载失败: {e}")
+                    df = pd.DataFrame()
+
+            elapsed = time.time() - start_time
+            result['elapsed'] = elapsed
+            result['records'] = len(df) if df is not None and not df.empty else 0
+
+            if result['records'] > 0:
+                result['throughput'] = result['records'] / elapsed if elapsed > 0 else 0
+                result['level'] = '✅ 有数据'
+                print(f"   ✅ 读取成功: {result['records']:,} 条")
+                print(f"   ⏱️ 耗时: {elapsed:.4f}s")
+                print(f"   🚀 吞吐量: {result['throughput']:,.0f} 条/秒")
+            else:
+                result['error'] = f'QMT API无数据'
+                result['level'] = '⚠️ 无数据'
+                print(f"   ⚠️ QMT API返回空数据")
+
+        except Exception as e:
+            elapsed = time.time() - start_time
+            result['elapsed'] = elapsed
             result['error'] = str(e)
             result['level'] = '❌ 异常'
-        
+            print(f"   ❌ QMT API读取失败: {e}")
+            import traceback
+            traceback.print_exc()
+
         return result
-    
+
     def export_performance_report(self):
         """导出性能测试报告"""
         try:
@@ -2940,24 +3647,31 @@ class AdvancedDataViewerWidget(QWidget):
                 return
             
             from datetime import datetime
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            filename = f"performance_report_{timestamp}.txt"
             
-            filepath, _ = QFileDialog.getSaveFileName(
-                self, "保存性能报告", filename, "文本文件 (*.txt)"
+            filepath, selected_filter = QFileDialog.getSaveFileName(
+                self, "保存性能报告", f"performance_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                "文本文件 (*.txt);;CSV文件 (*.csv);;Excel文件 (*.xlsx)"
             )
             
             if not filepath:
                 return
             
-            with open(filepath, 'w', encoding='utf-8') as f:
-                f.write(self.test_result_text.toPlainText())
+            df = pd.DataFrame(self._last_perf_test_data)
             
-            QMessageBox.information(
-                self, "成功",
-                f"性能测试报告已保存至:\n{filepath}",
-                QMessageBox.Ok
-            )
+            if filepath.endswith('.csv'):
+                df.to_csv(filepath, index=False, encoding='utf-8-sig')
+                QMessageBox.information(self, "成功", f"CSV报告已保存至:\n{filepath}")
+            elif filepath.endswith('.xlsx'):
+                df.to_excel(filepath, index=False, sheet_name='性能测试结果')
+                QMessageBox.information(self, "成功", f"Excel报告已保存至:\n{filepath}")
+            else:
+                with open(filepath, 'w', encoding='utf-8') as f:
+                    f.write(self.test_result_text.toPlainText())
+                QMessageBox.information(
+                    self, "成功",
+                    f"性能测试报告已保存至:\n{filepath}",
+                    QMessageBox.Ok
+                )
             
         except Exception as e:
             QMessageBox.critical(self, "错误", f"导出报告失败: {str(e)}")
@@ -3733,27 +4447,89 @@ class TickDataLoadThread(QThread):
                     self.error_occurred.emit("stock_tick 视图不存在，请先在「数据管理」页面点击「🔄 重新生成数据库视图」按钮")
                     return
                 
+                # 查询stock_tick表的实际列名
+                columns_query = """
+                    SELECT column_name FROM information_schema.columns 
+                    WHERE table_name = 'stock_tick'
+                """
+                columns_df = manager.query_dataframe(columns_query)
+                existing_columns = set(columns_df['column_name'].tolist()) if columns_df is not None and not columns_df.empty else set()
+                
+                # 构建动态查询语句
+                select_clauses = [
+                    'datetime',
+                    'open',
+                    'high',
+                    'low',
+                    'close',
+                    'volume',
+                    'amount'
+                ]
+                
+                # 只选择实际存在的列
+                if 'lastPrice' in existing_columns:
+                    select_clauses.append('lastPrice')
+                else:
+                    select_clauses.append('0 as lastPrice')
+                
+                if 'lastClose' in existing_columns:
+                    select_clauses.append('lastClose')
+                else:
+                    select_clauses.append('0 as lastClose')
+                
+                if 'pvolume' in existing_columns:
+                    select_clauses.append('pvolume')
+                else:
+                    select_clauses.append('0 as pvolume')
+                
+                if 'transactionNum' in existing_columns:
+                    select_clauses.append('transactionNum')
+                else:
+                    select_clauses.append('0 as transactionNum')
+                
+                if 'func_type' in existing_columns:
+                    select_clauses.append('func_type')
+                else:
+                    select_clauses.append('0 as func_type')
+                
+                if 'openInt' in existing_columns:
+                    select_clauses.append('openInt')
+                else:
+                    select_clauses.append('0 as openInt')
+                
+                if 'lastSettlementPrice' in existing_columns:
+                    select_clauses.append('lastSettlementPrice')
+                else:
+                    select_clauses.append('0 as lastSettlementPrice')
+                
+                if 'stockStatus' in existing_columns:
+                    select_clauses.append('stockStatus')
+                else:
+                    select_clauses.append('0 as stockStatus')
+                
+                if 'askPrice' in existing_columns:
+                    select_clauses.append('askPrice')
+                else:
+                    select_clauses.append("'[]' as askPrice")
+                
+                if 'bidPrice' in existing_columns:
+                    select_clauses.append('bidPrice')
+                else:
+                    select_clauses.append("'[]' as bidPrice")
+                
+                if 'askVol' in existing_columns:
+                    select_clauses.append('askVol')
+                else:
+                    select_clauses.append("'[]' as askVol")
+                
+                if 'bidVol' in existing_columns:
+                    select_clauses.append('bidVol')
+                else:
+                    select_clauses.append("'[]' as bidVol")
+                
                 query = f"""
                     SELECT
-                        datetime,
-                        open,
-                        high,
-                        low,
-                        close,
-                        lastPrice,
-                        lastClose,
-                        volume,
-                        pvolume,
-                        amount,
-                        transactionNum,
-                        func_type,
-                        openInt,
-                        lastSettlementPrice,
-                        stockStatus,
-                        askPrice,
-                        bidPrice,
-                        askVol,
-                        bidVol
+                        {', '.join(select_clauses)}
                     FROM "stock_tick"
                     WHERE stock_code = '{self.stock_code}'
                       AND DATE_TRUNC('day', datetime) = '{self.tick_date}'

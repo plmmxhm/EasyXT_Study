@@ -861,7 +861,8 @@ class DailyDataStrategy(DataDownloadStrategy):
         if symbol not in raw_data or raw_data[symbol] is None:
             return pd.DataFrame()
         
-        df = raw_data[symbol]
+        # 【修复】创建副本而不是视图，避免SettingWithCopyWarning
+        df = raw_data[symbol].copy()
         
         # 标准化列名
         df.columns = df.columns.str.lower()
@@ -942,7 +943,8 @@ class BondDataStrategy(DataDownloadStrategy):
                         # 过滤日期范围
                         if 'time' in df.columns:
                             df['time'] = pd.to_datetime(df['time'])
-                            df = df[(df['time'] >= start_dt) & (df['time'] <= end_dt)]
+                            # 【修复】使用.copy()避免SettingWithCopyWarning
+                            df = df[(df['time'] >= start_dt) & (df['time'] <= end_dt)].copy()
                             df = df.set_index('time')
                         else:
                             df = df.loc[start_dt:end_dt]
@@ -979,7 +981,8 @@ class BondDataStrategy(DataDownloadStrategy):
         if symbol not in raw_data or raw_data[symbol] is None:
             return pd.DataFrame()
         
-        df = raw_data[symbol]
+        # 【修复】创建副本而不是视图，避免SettingWithCopyWarning
+        df = raw_data[symbol].copy()
         
         # 标准化列名
         df.columns = df.columns.str.lower()
@@ -1100,7 +1103,8 @@ class TickDataStrategy(DataDownloadStrategy):
         if symbol not in raw_data or raw_data[symbol] is None:
             return pd.DataFrame()
         
-        df = raw_data[symbol]
+        # 【修复】创建副本而不是视图，避免SettingWithCopyWarning
+        df = raw_data[symbol].copy()
         
         # 转换时间格式
         if 'time' in df.columns:
@@ -1139,10 +1143,11 @@ class TickDataStrategy(DataDownloadStrategy):
             # 过滤出交易时间的数据
             # 上午：9:15-11:30
             # 下午：13:00-15:00
+            # 【修复】使用.copy()避免SettingWithCopyWarning
             df = df[
                 ((df['datetime'].dt.hour >= 9) & (df['datetime'].dt.hour < 12)) |
                 ((df['datetime'].dt.hour >= 13) & (df['datetime'].dt.hour < 15))
-            ]
+            ].copy()
         
         # 添加元数据
         df['stock_code'] = symbol

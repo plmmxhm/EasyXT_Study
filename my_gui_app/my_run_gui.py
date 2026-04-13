@@ -151,6 +151,38 @@ def main():
     # 所有检查通过，启动应用
     print_log("\n[OK] 所有检查通过，正在启动应用...\n")
     print_log("=" * 70)
+    
+    # 【性能优化】2026-04-13: 启动时预检查所有DuckDB表
+    # 避免运行时重复检查表存在性（每次save_data都会检查）
+    # 预检查后，后续所有操作使用缓存，零开销
+    try:
+        from src.core.data.storage.duckdb_storage_manager import DuckDBStorageManager
+        import yaml
+        
+        config_path = os.path.join(project_root, 'config', 'data_config.yaml')
+        if os.path.exists(config_path):
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config = yaml.safe_load(f)
+            
+            data_db_path = os.path.join(
+                config.get('data_paths', {}).get('root_dir', 'D:/MyStockData'),
+                config.get('database', {}).get('data_db', {}).get('dbfile', 'stock_data.duckdb')
+            )
+            
+            print_log("[*] 预检查DuckDB物理表...")
+            success, msg = DuckDBStorageManager.precheck_all_tables(data_db_path)
+            
+            if success:
+                print_log(f"  [OK] {msg}")
+                print_log("  [INFO] 后续数据保存将使用缓存（零开销）")
+            else:
+                print_log(f"  [WARNING] {msg}")
+                print_log("  [INFO] 将在首次保存时自动创建缺失的表")
+        
+    except Exception as e:
+        print_log(f"  [WARNING] 表预检查跳过: {e}")
+        print_log("  [INFO] 不影响正常使用，将在需要时自动创建表")
+    
     print_log("")
     
     # 动态导入并启动应用
